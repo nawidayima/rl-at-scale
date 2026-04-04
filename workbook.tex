@@ -1,0 +1,91 @@
+\documentclass[10pt, letterpaper]{article}
+
+\usepackage[margin=0.7in, top=0.6in, bottom=0.6in]{geometry}
+
+\input{preamble}
+
+\pagestyle{plain}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+\titleformat{\section}{\Large\bfseries\scshape}{}{0em}{}[\titlerule]
+\titlespacing*{\section}{0pt}{12pt}{6pt}
+\titleformat{\subsection}{\large\bfseries}{}{0em}{}
+\titlespacing*{\subsection}{0pt}{8pt}{4pt}
+\titleformat{\subsubsection}{\normalsize\bfseries\itshape}{}{0em}{}
+\titlespacing*{\subsubsection}{0pt}{6pt}{3pt}
+\setlist[itemize]{nosep, leftmargin=1.4em, label=\textbullet, topsep=2pt}
+\setlist[enumerate]{nosep, leftmargin=1.8em, topsep=2pt}
+
+\lstset{
+  language=Python,
+  basicstyle=\small\ttfamily,
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!50!black},
+  stringstyle=\color{red!60!black},
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+  aboveskip=6pt,
+  belowskip=6pt,
+}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE \textbf{RL \& Performance Engineering Workbook}}\\[4pt]
+  {\large Intelligence per Watt: From Kernels to RLVR Pipelines}\\[6pt]
+  {\small v2.0 --- \today}
+\end{center}
+
+\bigskip
+
+\textbf{Governing metric.} Every chapter in this workbook is organized around a single number: \textit{intelligence per Watt} --- the ratio of model capability to the energy required to produce it. Maximizing that ratio requires compressing both sides simultaneously: fewer FLOPs per forward pass (hardware and kernel chapters) and higher quality per FLOP (RL algorithm chapters).
+
+\textbf{Three-tier structure.}
+\begin{itemize}
+  \item \textbf{Tier~1 --- PE Foundations (Chapters~1--5):} Hardware benchmarking (AMD, NVIDIA, TPU), inference efficiency, and distributed training. These chapters optimize FLOPs/Watt.
+  \item \textbf{Tier~2 --- RL Depth (Chapters~6--7):} Hypothesis-driven policy gradient study and a hands-on community OSS framework. These chapters optimize Quality/FLOP.
+  \item \textbf{Tier~3 --- RL Systems (Chapters~8--9):} Pipeline verification, reward engineering, and scaling laws. These chapters supply the systems foundation that makes Tier~2 work at scale.
+\end{itemize}
+
+\textbf{Box types.}
+\begin{itemize}
+  \item \textbf{Purple (Think-First, no computer):} Conceptual foundations. Reason through the problem before touching code.
+  \item \textbf{Yellow (Exercise):} Hands-on implementation with explicit deliverables.
+  \item \textbf{Green (Portfolio):} Publishable projects with external verification criteria.
+\end{itemize}
+
+\textbf{Recommended priority ordering.}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Priority} & \textbf{Chapter} & \textbf{Rationale} & \textbf{Compute} \\
+\midrule
+1a & Ch1 (AMD MI300X)      & ``Derisk Infrastructure Decision''; chip performance is still unknown & \textasciitilde\$300/mo \\
+1b & Ch6 (Policy Gradient) & \$0 parallel track; builds RL depth immediately           & \$0 \\
+2  & Ch7 (TinyRL)          & Community artifact; OSS + leaderboard signal             & \textasciitilde\$100/mo \\
+3  & Ch4 (RL Inference)    & \#1 RLVR bottleneck in production                        & \textasciitilde\$100/mo \\
+4  & Ch2 or Ch3 (NVIDIA/TPU) & Current stack depth; covers GPU and TPU Kernel Eng     & \textasciitilde\$250/mo \\
+5  & Ch5 (Distributed)     & Cluster efficiency at scale                               & \textasciitilde\$200/mo \\
+6  & Ch8--9 (RL Systems)   & Systems background; read after core chapters              & \textasciitilde\$100/mo \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\newpage
+
+\input{workbook/01-amd-benchmarking}
+\input{workbook/02-cuda-kernels}
+\input{workbook/03-tpu-pallas}
+\input{workbook/04-inference-serving}
+\input{workbook/05-distributed-training}
+\input{workbook/06-policy-gradients}
+\input{workbook/07-tinyrl-pipeline-scaling}
+\input{workbook/08-synthesis}
+
+\end{document}
