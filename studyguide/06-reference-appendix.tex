@@ -1,0 +1,88 @@
+\section{13. Key Concepts: Quick Reference}
+% ============================================================
+
+These are the concepts you need to explain fluently. Practice saying each one aloud in one sentence.
+
+\subsection{The Algorithms}
+
+\textbf{RLHF:} Train a reward model from human preferences, then RL-optimize the LM against it. Three stages: SFT $\to$ Reward Model $\to$ PPO.
+
+\textbf{PPO:} Policy gradient with a clipping trick that prevents updates from being too large. Requires a critic network (value function) to estimate advantages. Stable but memory-hungry.
+
+\textbf{DPO:} Rearranges the RLHF math to eliminate the reward model. Directly optimizes the policy on preference pairs using a cross-entropy loss. Simple but offline --- can't explore.
+
+\textbf{GRPO:} PPO without the critic. Estimates advantages using group statistics (mean/std of rewards across multiple samples for the same prompt). Saves $\sim$50\% GPU memory.
+
+\textbf{Constitutional AI (RLAIF):} Replace human feedback with AI feedback. Model critiques its own outputs against explicit principles. Anthropic's core approach to scalable alignment.
+
+\subsection{The Scaling Concepts}
+
+\textbf{Scaling laws:} Loss improves as a power law with compute, parameters, and data. Straight lines on log-log plots. Diminishing returns per OOM but still massive gains.
+
+\textbf{Chinchilla-optimal:} For a given compute budget, scale parameters and data equally. Kaplan-era models were over-parameterized and under-trained.
+
+\textbf{Three-axis scaling:} Pretraining (params $\times$ data), RL training (on top of base model), and test-time compute (chain-of-thought, search) are independent scaling axes.
+
+\textbf{The bitter lesson:} General methods + scale beat clever domain-specific tricks. Every time. Anthropic's RL scaling philosophy is ``end-to-end'' --- optimize the whole pipeline, not clever tricks at each stage.
+
+\subsection{The Systems Concepts}
+
+\textbf{KL divergence penalty:} A leash that keeps the RL-optimized policy close to the original SFT model. Without it: reward hacking. Too strong: can't improve. Tuning $\beta$ is an art.
+
+\textbf{Reward hacking:} Policy exploits imperfections in the reward proxy. The fundamental unsolved problem of RL for LLMs.
+
+\textbf{Process vs.\ Outcome rewards:} Process rewards (PRM) score each reasoning step; outcome rewards (ORM) score only the final answer. PRMs give more signal but are harder to build and can be gamed at the step level.
+
+\textbf{Rejection sampling:} Generate many outputs, keep the best (by reward score). Simple, no gradient needed. Used in DeepSeek R1 Stage 3 to build training data from the RL checkpoint.
+
+\textbf{Superposition:} Models encode more features than they have dimensions by using nearly-orthogonal directions. Larger models have less superposition, making them easier to interpret.
+
+\textbf{Distributed training:} DDP (Data Parallel) = same model on every GPU, different data. FSDP (Fully Sharded) = model weights split across GPUs, reassembled for each forward pass. FSDP scales to larger models.
+
+\subsection{Alternative Paradigms (vocabulary only)}
+
+\textbf{JEPA (Joint Embedding Predictive Architecture):} Predicts masked \textit{embeddings}, not pixels or tokens. L2 loss in representation space. Avoids modeling irrelevant detail. Requires anti-collapse regularization (VICReg). LeCun's thesis for AMI. Strong on perception; undemonstrated on abstract reasoning.
+
+\textbf{Model-based RL (Dreamer):} Learn a world model (dynamics in latent space), then optimize the policy ``in imagination'' --- rollouts inside the learned model, not the real environment. $\sim$10$\times$ sample efficiency on control tasks, but 2--5$\times$ compute overhead. DreamerV3 collected diamonds in Minecraft from scratch.
+
+\textbf{Model-free vs.\ model-based:} Anthropic's approach (PPO/GRPO) is model-free --- policy learns directly from environment reward. Model-based would help if environment interactions were expensive. For code RL, the interpreter is nearly free, so sample efficiency matters less than verification quality. The real bottleneck is the reward signal, not the number of rollouts.
+
+\subsection{Key Terms: 2025+ Paradigm}
+
+\textbf{RLVR (RL from Verifiable Rewards):} Deterministic, rule-based verification (math correctness, unit tests, formal proofs). Non-gameable by design. Allows weeks-long optimization without reward hacking. The 2025+ dominant training paradigm --- replaced RLHF as the main RL compute consumer. Key property: the verifier cannot be fooled by surface-level mimicry.
+
+\textbf{MoE (Mixture of Experts):} Sparse activation --- all expert weights are loaded into HBM but only $K$ of $N$ experts activate per token. Memory-hungry (all weights resident) but compute-efficient (only $K\times$ active FLOPs). Expert routing requires all-to-all communication across devices. The HBM capacity constraint makes MI300X's 192 GB a meaningful architectural advantage over H100's 80 GB for large MoE models.
+
+\textbf{Speculative Decoding:} A draft model proposes $K$ tokens; the target model verifies all $K$ in a single forward pass (parallel). Accepted tokens are kept; the first rejection discards the rest. Speeds up autoregressive generation by amortizing the target model's cost. Under RLVR: the target policy shifts continuously during training, causing the draft model's distribution to diverge from the target --- acceptance rates degrade, and periodic draft model recalibration becomes necessary.
+
+% ============================================================
+\section{14. Appendix: Equations (Reference Only)}
+% ============================================================
+
+\small
+Only consult if the conversation goes deep on specifics.
+
+\textbf{Bradley-Terry:} $P(y_w \succ y_l | x) = \sigma(r(x, y_w) - r(x, y_l))$
+
+\textbf{RLHF objective:}
+$\max_\pi\, \mathbb{E}[r_\phi(x,y)] - \beta \cdot D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}]$
+
+\textbf{PPO clip:} $\mathcal{L} = \mathbb{E}[\min(\rho_t \hat{A}_t,\, \text{clip}(\rho_t, 1{\pm}\epsilon)\hat{A}_t)]$
+
+\textbf{DPO:} $\mathcal{L} = -\mathbb{E}[\log \sigma(\beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)})]$
+
+\textbf{GRPO advantage:} $A_i = (r_i - \bar{r}) / \text{std}(r)$ across group samples
+
+\textbf{Scaling law:} $L(C) \approx (C_c / C)^{\alpha_C}$ \quad (power law, linear on log-log)
+
+\textbf{Attention:} $\text{Attn}(Q,K,V) = \text{softmax}(QK^\top / \sqrt{d_k})\, V$
+
+\textbf{KL divergence:} $D_{\text{KL}}(P\|Q) = \sum P(x) \log(P(x)/Q(x))$
+
+\normalsize
+
+\vfill
+\begin{center}
+\small\textit{Compiled April 3, 2026. v2 --- PE/RL track.}
+\end{center}
+

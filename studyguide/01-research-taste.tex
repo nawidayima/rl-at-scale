@@ -1,0 +1,40 @@
+\section{1. Research Taste: How to Pick Problems}
+% ============================================================
+
+\begin{bluf}
+Frontier RL teams evaluate people on \textit{problem selection} more than problem-solving. Can you identify what's high-leverage, tractable, and ungameable? This section is the most important one in this guide.
+\end{bluf}
+
+\subsection{The Problem Selection Framework}
+
+RL scaling leads consistently value:
+
+\begin{enumerate}
+  \item \textbf{Is the feedback signal clean?} Can you verify success deterministically, or are you relying on a fuzzy proxy? Clean signal = RL works. Fuzzy proxy = reward hacking. \textit{(In the RLVR paradigm, this means: is the reward deterministically verifiable? Math answers, unit tests, and formal proofs are the gold standard. Neural reward models are proxies --- usable but gameable.)}
+  \item \textbf{Is the iteration loop fast?} ``Cycle time separates people.'' Can you get a result in hours, not weeks? If the experiment takes a month, you've already lost.
+  \item \textbf{Is it underexplored?} ``One of the ways he's been impactful is by picking problems that haven't been well-solved.'' Avoid the hot problem where 50 PhD students are competing.
+  \item \textbf{Does it compound?} A good problem produces a tool, eval, or insight that unlocks many future problems. A bad problem produces one number on one benchmark.
+  \item \textbf{Are you attacking the problem directly?} Not applying your favorite tool to a new domain, but asking: what does \textit{this specific problem} actually need?
+\end{enumerate}
+
+\subsection{Demonstrating Taste in Conversation}
+
+Don't just say ``I'd pick high-leverage problems.'' Show the \textit{method}:
+
+\begin{sayit}[Problem selection]
+``When I think about what to work on, I ask: is there a clean way to know if I succeeded? And can I get signal in hours, not weeks? For example, imagine a classification task stuck at 64\% accuracy. The bottleneck might not be the model --- it might be the lack of a clean reward signal. One approach: retrieve similar past cases where a domain expert already decided, use those as few-shot exemplars, then verify against the expert's decision. That gives you a tight loop with deterministic feedback. Signal quality is usually more important than model quality.''
+\end{sayit}
+
+\begin{whyanthro}
+The RL scaling team faces this \textit{exact} problem at larger scale: where do clean feedback signals exist? Math and code fell first because compilers and proof checkers are perfect verifiers. The frontier is: what domains come next, and how do you build verification for them?
+\end{whyanthro}
+
+\subsection{The Taste Vignette (practice this)}
+
+If asked ``what would you work on?'', don't prescribe --- show your selection process:
+
+\begin{sayit}[What I'd work on]
+``Honestly, I'd want to understand your team's backlog before prescribing. But my instinct is that the verification frontier is the binding constraint --- RL has clearly worked where signals are clean. So I'd be drawn to problems like: can you build reliable automated verifiers for domains that don't have natural ones? Or: when models game your verifiers, what's the taxonomy of failure modes, and can you systematically harden against them? Those feel high-leverage because they'd unlock RL for entire new capability domains.''
+\end{sayit}
+
+% ============================================================

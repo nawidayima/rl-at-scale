@@ -1,0 +1,284 @@
+\section{6. The Verification Bottleneck Pattern (Systems Framing)}
+% ============================================================
+
+\begin{bluf}
+Verification quality is the binding constraint on RL progress --- not compute, not algorithms, not data. This pattern recurs at every level of the stack. Recognizing it is one of the clearest signals of systems thinking in an interview.
+\end{bluf}
+
+\subsection{The Pattern}
+
+``Why is robotic manipulation harder than locomotion? Because it's hard to verify correctness.'' This insight generalizes far beyond robotics:
+
+\begin{itemize}
+  \item \textbf{RL training:} Reward hacking is a verification failure --- the model found a way to score well that your verifier doesn't catch
+  \item \textbf{Performance engineering:} A kernel that's fast but numerically wrong is worse than useless. How do you verify correctness, not just speed?
+  \item \textbf{Hardware evaluation:} Micro-benchmarks don't predict production workload performance. How do you verify that benchmark results extrapolate to real training runs?
+  \item \textbf{Scaling:} Small-scale experiment results may not predict large-scale outcomes. How do you verify that what works at \$10K will still work at \$10M?
+\end{itemize}
+
+\subsection{The Intelligence-per-Watt Framing}
+
+A unifying metric for PE and RL work:
+
+\[
+\text{Intelligence per Watt} = \underbrace{\frac{\text{Quality}}{\text{FLOP}}}_{\text{RL domain}} \times \underbrace{\frac{\text{FLOPs}}{\text{Watt}}}_{\text{PE domain}}
+\]
+
+\begin{itemize}
+  \item \textbf{FLOPs/Watt} = performance engineering. Better kernels, higher utilization, less idle energy.
+  \item \textbf{Quality/FLOP} = RL and algorithms. Better training, better rewards, smarter scaling. Also: quantization (same quality at lower precision = fewer FLOPs).
+\end{itemize}
+
+Every wasted RL training step (reward hacking, divergence, mode collapse) is wasted compute. A reward signal that's 10\% more robust effectively gives you 10\% more intelligence per Watt from the RL training budget.
+
+\begin{sayit}[Verification bottleneck]
+``I think verification quality is the real bottleneck --- not compute, not algorithms. RL worked for math and code because compilers and proof checkers are near-perfect verifiers. The hard problems are the ones where verification is fuzzy. And the same pattern shows up in PE: a fast kernel is worthless if it's numerically wrong. Even hardware evaluation is a verification problem --- how do you know your benchmarks predict production?''
+\end{sayit}
+
+\begin{whyanthro}
+This framing connects PE and RL into a single story. It shows that you think about the \textit{system}, not just your piece of it. The PE-RL flywheel --- PE makes RL faster, RL automates PE decisions --- is the natural consequence of this framing.
+\end{whyanthro}
+
+% ============================================================
+\section{7. The Hard Questions (and Strong Answers)}
+% ============================================================
+
+\begin{bluf}
+Interviewers will probe your weaknesses. Your job isn't to pretend they don't exist --- it's to show trajectory, self-awareness, and that your strengths address the team's actual bottleneck. Frontier labs respect honesty and agency over credentials.
+\end{bluf}
+
+\subsection{``Tell me about your RL experience''}
+
+\textbf{Don't:} Overstate, list courses, or mumble.
+
+\begin{sayit}[RL experience gap]
+``I'll be direct: my RL experience is self-taught, not production-scale. But I've built the systems that RLVR needs: AMD MI300X benchmarks showing where hardware wins and loses for RLVR workloads, TinyRL-Code --- an open-source RLVR environment with a verification hacking gallery, and hypothesis-driven experiments on policy gradient dynamics under extended RLVR optimization. The muscle I've trained is verification engineering and performance analysis --- finding where intelligence per Watt is being wasted and fixing it.''
+\end{sayit}
+
+\subsection{``Why no PhD? Why should we hire you?''}
+
+\begin{sayit}[No PhD]
+``I've spent my time building things under real constraints --- not toy problems with clean data. I've shipped production systems that handle messy inputs, tight deadlines, and real requirements. The training pipeline is held together by duct tape and needs engineers who can improve every part of it. The skill that's hardest to teach is the ability to ship under uncertainty. Independent projects --- hardware benchmarks, kernel optimization guides, minimal RL environments --- demonstrate the same research taste a PhD would, with artifacts a team can actually use. And RLVR has shifted the bottleneck from research novelty to engineering execution --- the training pipeline needs engineers who can optimize generation throughput across hardware platforms and build robust verifiers, not just publish papers.''
+\end{sayit}
+
+\subsection{``Why leave startups for a lab?''}
+
+\begin{sayit}[Why a lab]
+``Leverage. At a startup, I can make one workflow cheaper. At Anthropic, improving the training pipeline makes \textit{every} downstream application better. I've seen firsthand how brittle hand-crafted systems are --- I want to work on the general-purpose engine that replaces them all. That's the bitter lesson applied to my own career.''
+\end{sayit}
+
+\subsection{``What's the hardest debugging problem you've solved?''}
+
+Prep your own production debugging story. Emphasize: (1) diagnosing the real problem (bad signal, not bad model), (2) the fix (better feedback, not more parameters), (3) measurement (concrete before/after numbers, adversarial eval set).
+
+\subsection{``What would you work on?''}
+
+\begin{sayit}[What to work on]
+``The RLVR generation bottleneck. RLVR runs are orders of magnitude longer than RLHF --- generation throughput is the binding constraint for weeks. Can speculative decoding work under the distributional shift from ongoing training? Can we build verification environments that scale to new domains beyond math and code? I'd want to find the highest-leverage optimization in the generation $\to$ verification $\to$ training loop.''
+\end{sayit}
+
+\subsection{``What would your first 30 days look like?''}
+
+\begin{sayit}[First 30 days]
+``Week 1-2: instrument the existing RL pipeline. I'd want to understand what gets measured, what doesn't, and where the hardware utilization drops. Week 3-4: pick one piece of the infrastructure --- generation throughput, verification quality, or communication overhead --- and propose an improvement I can ship fast. I'd want one real PR merged before the month is over. Start with whatever gives the most intelligence per Watt per engineer-hour.''
+\end{sayit}
+
+% ============================================================
+\section{8. Independent Research Proposals}
+% ============================================================
+
+\begin{bluf}
+These proposals target the two binding constraints of RL scaling teams: (1) predicting whether an expensive training run will work before spending the compute, and (2) making the training pipeline faster so the team iterates more. Each produces a publishable artifact. Pick one.
+\end{bluf}
+
+\subsection{Proposal 1: AMD MI300X RLVR Benchmarking Study}
+
+\textbf{Problem:} Anthropic needs empirical data on AMD viability for RLVR workloads to inform a multi-billion dollar hardware decision. No rigorous public benchmark exists covering the specific operations that dominate RLVR wall time.
+
+\textbf{The project:} Benchmark the MI300X on 7 RLVR-critical operations: (1) generation throughput (autoregressive decode), (2) attention kernels, (3) all-reduce communication, (4) mixed-precision training (FP8/BF16/FP32 accumulation), (5) KV cache bandwidth under extended rollouts, (6) MoE memory behavior (expert weights competing with KV cache), (7) decode-path utilization. Compute intelligence-per-Watt comparison vs.\ H100 for each operation.
+
+\textbf{Deliverable:} Blog post + OSS benchmark repo + gap analysis memo identifying which engineering investments would close the MI300X--H100 performance gap.
+
+\begin{whyanthro}
+This produces evidence that informs a hardware purchasing decision Anthropic hasn't yet made. A senior RL engineer can directly use the gap analysis and cost estimates. Demonstrates kernel fluency, quantitative rigor, and systems thinking on the exact hardware Anthropic is evaluating.
+\end{whyanthro}
+
+\smallskip\noindent\textit{See Workbook Chapter 1 for the full exercise progression.}
+
+\subsection{Proposal 2: TinyRL --- The MNIST of RL for LLMs}
+
+\textbf{Problem:} No standardized minimal environment exists for studying RLVR dynamics. Researchers waste weeks building custom training loops to answer basic questions about reward hacking, KL divergence, and mode collapse.
+
+\textbf{The project:} Open-source framework with three environments: \textbf{TinyRL-Code} (RLVR at toy scale: small coding tasks with unit-test verification, reward hacking gallery showing concrete exploitation strategies), \textbf{TinyRL-Align} (RLHF comparison: neural reward model vs.\ rule-based, head-to-head on identical tasks), \textbf{TinyRL-Quant} (PE-RL flywheel: RL automates per-layer precision selection, clean reward signal). Community leaderboards for each environment.
+
+\textbf{Deliverable:} OSS framework + blog post + community leaderboard. Pitch: ``Study the full RLVR training loop in 30 minutes on one GPU.''
+
+\begin{whyanthro}
+TinyRL-Code reproduces the verification engineering problem at toy scale. The reward hacking gallery demonstrates adversarial thinking about verifier failure modes --- directly relevant to the team's production problems. Community contributions create network effects that make the framework a reference artifact.
+\end{whyanthro}
+
+\smallskip\noindent\textit{See Workbook Chapter 7 for the full exercise progression.}
+
+\subsection{Proposal 3: RL Inference Efficiency Guide}
+
+\textbf{Problem:} RLVR spends 50--70\% of wall time on generation (autoregressive rollout), but no public analysis covers speculative decoding under RLVR distributional shift or optimal batching strategies for GRPO rollouts.
+
+\textbf{The project:} Three technical analyses: (1) KV cache management under MoE --- expert weights compete with KV cache for HBM; measure how context length degrades under this pressure; (2) speculative decoding acceptance rate degradation --- as the target policy shifts during training, the draft model's distribution diverges; measure the degradation curve and identify training checkpoints where re-calibration is needed; (3) variable-length batching strategies for GRPO rollouts --- different rollout lengths create padding waste; measure batch efficiency under realistic RLVR length distributions.
+
+\textbf{Deliverable:} Blog post with measurements + prototype implementations demonstrating each strategy.
+
+\begin{whyanthro}
+Generation throughput is the binding constraint for RLVR --- Karpathy noted RLVR ``gobbled up the compute originally intended for pretraining.'' This analysis directly addresses the \#1 bottleneck. Each finding produces a concrete engineering recommendation the team can act on.
+\end{whyanthro}
+
+\smallskip\noindent\textit{See Workbook Chapter 4 for the full exercise progression.}
+
+\begin{whyanthro}
+Don't pitch all three. Float the one that excites you, then ask: ``Does this feel directionally right? What would you change about the framing?'' This turns the conversation from pitch to collaboration.
+\end{whyanthro}
+
+% ============================================================
+\section{9. Questions That Show Depth}
+% ============================================================
+
+\begin{bluf}
+Good questions demonstrate research taste better than good answers. These are ranked by how much they reveal about your thinking. Pick 2--3 that feel authentic to you.
+\end{bluf}
+
+\subsection{Tier 1: Verification \& Signal Quality}
+
+``Math and code had clean verification. What's the next domain your team is trying to crack, and what makes the verification problem there fundamentally different?''
+
+``When models game unit tests by hard-coding values --- is that primarily a verification design problem or an RL training problem? Where do you invest to fix it?''
+
+``How do you decide when a reward signal is `clean enough' to justify a large RL training run? Is there a way to predict signal quality before you spend the compute?''
+
+\subsection{Tier 1: Hardware \& Generation Bottleneck}
+
+``Dario described KV cache management as an engineering problem, not research. Under MoE, expert weights compete with KV cache for HBM. What's your team's memory allocation strategy, and where does it break under extended RLVR runs?''
+
+``RLVR runs last weeks. Has speculative decoding been useful for rollouts, or does distributional shift invalidate the draft model too quickly?''
+
+``Karpathy noted RLVR gobbled up the compute originally intended for pretraining. How does your team think about the pretraining $\to$ RLVR compute allocation?''
+
+\subsection{Tier 2: Systems \& Scaling}
+
+``You've talked about the pipeline being primitive. If you could wave a wand and fix one piece of RL training infrastructure tomorrow, what would it be?''
+
+``Things that help at small scale can hurt at large scale. What's the most counterintuitive example of that you've seen in RL training?''
+
+\subsection{Tier 3: Bigger Picture}
+
+``You predicted continual learning gets solved this year. What would `solved in a satisfying way' look like?''
+
+``How do you think about the Pareto frontier between pretraining compute, RL compute, and test-time compute? Is there a principled way to allocate, or is it still empirical?''
+
+``LeCun's been pushing JEPA and world models as an alternative path --- learning dynamics in latent space rather than predicting tokens. DreamerV3 got impressive sample efficiency on control tasks. Is there anything from the model-based RL playbook that's useful for your team, or is the verification bottleneck so dominant that sample efficiency doesn't matter?''
+
+% ============================================================
+\section{10. Why These Projects Demonstrate Depth}
+% ============================================================
+
+\begin{bluf}
+Two independent projects have become canonical examples of depth at frontier labs: Andy Jones's ``Scaling Scaling Laws with Board Games'' and Simon Boehm's CUDA matmul optimization blog. Understanding \textit{why} these resonated reveals what RL scaling teams actually value.
+\end{bluf}
+
+\subsection{The Strategic Logic (work backwards)}
+
+\textbf{Frontier coding agents are the revenue engine} for AI labs --- capabilities come from RLVR training on coding tasks, where unit tests provide clean verification. The RL scaling team is the team that makes these agents better.
+
+An RL scaling team's two binding constraints:
+\begin{enumerate}
+  \item \textbf{Predicting whether an expensive RL training run will work} before spending the compute (scaling prediction)
+  \item \textbf{Making the training pipeline faster} so the team can iterate more (infrastructure/systems)
+\end{enumerate}
+
+Each recommended project targets exactly one of these constraints.
+
+\subsection{Project A: Scaling Scaling Laws (Andy Jones)}
+
+\textbf{What he did:} Trained AlphaZero agents on the game Hex at board sizes 3$\times$3 through 9$\times$9. Showed that the scaling law discovered on small boards \textit{accurately predicts performance on larger boards the agent has never seen}.
+
+\textbf{The key scaling law:} Performance (Elo) scales linearly with log-compute in an ``active'' regime, with the curve shifting predictably with board size (problem difficulty):
+
+\begin{itemize}
+  \item 500 Elo per order of magnitude of compute (equivalently: 2$\times$ compute gives $\sim$2/3 win rate)
+  \item 7$\times$ more compute needed for perfect play per board-size increment
+  \item Prediction error decays \textit{exponentially} as you add more small-board data points
+\end{itemize}
+
+\textbf{The train-time / test-time tradeoff:} 10$\times$ more training compute lets you eliminate $\sim$15$\times$ of inference-time search. Train and test compute substitute log-linearly.
+
+\begin{whyanthro}
+This is \textit{exactly} the problem The RL scaling team faces. Before spending \$10M on a large RL training run, can you predict from \$10K experiments whether the reward signal and algorithm will hold at scale? The principle: ``You want to be sure that you've algorithmically got the right thing before you bet on the large compute spend.'' Andy Jones demonstrated, on a solo project, the core skill of predicting what will scale. He's now at Anthropic.
+\end{whyanthro}
+
+\textbf{Open questions from the paper} (open research directions):
+\begin{enumerate}
+  \item Does extrapolation across problem difficulty generalize beyond Hex? What about coding tasks of varying complexity?
+  \item The 2/3 win-rate per 2$\times$ compute --- is this a universal constant or game-specific?
+  \item Can you predict \textit{when} scaling will break (when rewards become too noisy at scale)?
+  \item How do these scaling laws change when you vary the reward signal quality, not just the compute?
+  \item Bridge between single-agent and multi-agent scaling laws
+\end{enumerate}
+
+\begin{sayit}[Scaling prediction]
+``I've been reading Andy Jones's Hex scaling paper. The thing that struck me is the train/test compute tradeoff being so clean --- 10$\times$ training buys you 15$\times$ less search. That feels like it should have a direct analog in LLM RL: more training compute should reduce the chain-of-thought length needed at inference. Has your team seen that empirically? And do the problem-difficulty scaling laws hold when you vary reward signal quality, not just task complexity?''
+\end{sayit}
+
+\subsection{Project B: CUDA/TPU Optimization Guides}
+
+\textbf{What Simon Boehm did:} Wrote a blog post walking through optimizing a CUDA matrix multiplication kernel from 1.3\% to 93.7\% of cuBLAS performance, in 10 iterative steps. Each step: diagnose the bottleneck with a profiler, apply one optimization, measure the result.
+
+\textbf{The optimization progression:}
+
+\begin{tabular}{@{}lrl@{}}
+\toprule
+\textbf{Technique} & \textbf{GFLOPs} & \textbf{vs cuBLAS} \\
+\midrule
+Naive & 309 & 1.3\% \\
+Memory coalescing & 1,987 & 8.5\% \\
+Shared memory tiling & 2,980 & 12.8\% \\
+1D blocktiling & 8,475 & 36.5\% \\
+2D blocktiling & 15,972 & 68.7\% \\
+Vectorized loads & 18,237 & 78.4\% \\
+Warptiling & 21,779 & 93.7\% \\
+\bottomrule
+\end{tabular}
+
+\textbf{Why the format matters as much as the content:} Each step is: \textit{measure} $\to$ \textit{diagnose} $\to$ \textit{fix one thing} $\to$ \textit{measure again}. This is the cycle-time mindset frontier labs prize. The author documents failures, unexplained phenomena, and honest gaps --- realistic research, not a polished tutorial.
+
+\begin{whyanthro}
+The RL training pipeline is ``held together by duct tape.'' Every percentage point of hardware utilization matters at Anthropic's scale. An RE who can profile, diagnose, and optimize kernels directly accelerates the team's iteration speed. And writing it as a guide proves you can \textit{teach} --- making infrastructure legible to others, which is how you multiply a team's effectiveness.
+
+When frontier labs see a really good blog post where someone has done incredible independent work, ``it's one of the highest signal things there is'' and they reach out with interview offers.
+\end{whyanthro}
+
+\subsection{The Pattern Both Projects Share}
+
+Why these two, specifically? They both demonstrate:
+
+\begin{enumerate}
+  \item \textbf{Agency} --- independently conceived, no one assigned this
+  \item \textbf{Taste} --- directly relevant to frontier lab infrastructure, not a toy exercise
+  \item \textbf{Depth over breadth} --- went deep on one thing, not shallow on many
+  \item \textbf{Full-stack execution} --- from problem formulation through implementation to clear artifact
+  \item \textbf{Communication} --- a paper/blog post that teaches, not just reports
+  \item \textbf{Honest gaps} --- both acknowledge what they don't know (frontier labs evaluate intellectual honesty)
+\end{enumerate}
+
+\subsection{Applying the Pattern: Three Artifacts}
+
+A strong portfolio for the PE/RE track targets all three hiring signals with independent projects:
+
+\begin{enumerate}
+  \item \textbf{Hardware benchmark study} (targets constraint \#2: pipeline speed). De-risks a hardware decision. Shows kernel fluency + systems thinking + quantitative analysis leadership can act on. Pick a platform with scarce public data (see Section 8, Proposal 1).
+  \item \textbf{TinyRL environment} (targets both constraints). Demonstrates RL depth + PE relevance + novel contribution. The PE-RL flywheel in miniature: RL automating a PE decision (see Section 8, Proposal 2).
+  \item \textbf{Boehm-style pedagogical blog} (targets constraint \#2 + communication). Whichever chip you go deepest on. ``One of the highest signal things there is.''
+\end{enumerate}
+
+\begin{sayit}[If asked what you'd build]
+``I've been working on three things: an AMD MI300X benchmark for RLVR workloads --- here's where it wins on intelligence per Watt and what engineering would close the gaps. An open-source RLVR framework called TinyRL where anyone can study verification hacking in 30 minutes. And an analysis of the RLVR generation bottleneck --- how speculative decoding degrades under distributional shift and what that means for training throughput.''
+\end{sayit}
+
+% ============================================================
