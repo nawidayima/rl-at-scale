@@ -1,0 +1,82 @@
+% rl-at-scale shared preamble
+% Packages and custom environments used across all documents
+
+% --- Packages ---
+\usepackage{amsmath, amssymb}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{listings}
+\usepackage{fancyvrb}
+
+% --- Study Guide boxes ---
+
+% BLUF box - the one thing to walk away knowing
+\newtcolorbox{bluf}{
+  colback=black!5, colframe=black!70, boxrule=0.8pt,
+  left=4pt, right=4pt, top=3pt, bottom=3pt,
+  fonttitle=\bfseries\small, title=The Key Idea
+}
+
+% "How to say it" box
+\newtcolorbox{sayit}[1][]{
+  colback=green!4, colframe=green!50!black, boxrule=0.5pt,
+  left=4pt, right=4pt, top=2pt, bottom=2pt,
+  fonttitle=\bfseries\small, title=How to say it: #1
+}
+
+% "If they probe deeper" box
+\newtcolorbox{deeper}{
+  colback=orange!5, colframe=orange!60, boxrule=0.5pt,
+  left=4pt, right=4pt, top=2pt, bottom=2pt,
+  fonttitle=\bfseries\small, title=If they probe deeper
+}
+
+% "Why it matters for Anthropic" box
+\newtcolorbox{whyanthro}{
+  colback=blue!4, colframe=blue!40, boxrule=0.5pt,
+  left=4pt, right=4pt, top=2pt, bottom=2pt,
+  fonttitle=\bfseries\small, title=Why this matters for Anthropic
+}
+
+% --- Workbook boxes ---
+
+% Exercise box
+\newtcolorbox{exercise}[1][]{
+  colback=yellow!5, colframe=yellow!60!black, boxrule=0.6pt,
+  left=5pt, right=5pt, top=3pt, bottom=3pt,
+  fonttitle=\bfseries\small, title=Exercise: #1
+}
+
+% Think-first box (conceptual, no computer needed)
+\newtcolorbox{thinkfirst}[1][]{
+  colback=purple!5, colframe=purple!50, boxrule=0.5pt,
+  left=5pt, right=5pt, top=3pt, bottom=3pt,
+  fonttitle=\bfseries\small, title={Think First (no computer): #1}
+}
+
+% Portfolio project box
+\newtcolorbox{portfolio}[1][]{
+  colback=green!5, colframe=green!50!black, boxrule=0.6pt,
+  left=5pt, right=5pt, top=3pt, bottom=3pt,
+  fonttitle=\bfseries\small, title={Portfolio Project: #1}
+}
+
+% Why this matters box
+\newtcolorbox{whythis}{
+  colback=blue!4, colframe=blue!40, boxrule=0.5pt,
+  left=5pt, right=5pt, top=3pt, bottom=3pt,
+  fonttitle=\bfseries\small, title=Why This Matters at Frontier Scale
+}
+
+% Research taste box
+\newtcolorbox{taste}{
+  colback=gray!6, colframe=gray!60, boxrule=0.5pt,
+  left=5pt, right=5pt, top=3pt, bottom=3pt,
+  fonttitle=\bfseries\small, title=Research Taste Check
+}
