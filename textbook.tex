@@ -1,0 +1,69 @@
+\documentclass[11pt, letterpaper]{book}
+
+\usepackage[margin=1in]{geometry}
+
+\input{preamble}
+
+\pagestyle{plain}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+\titleformat{\section}{\Large\bfseries\scshape}{}{0em}{}[\titlerule]
+\titlespacing*{\section}{0pt}{12pt}{6pt}
+\titleformat{\subsection}{\large\bfseries}{}{0em}{}
+\titlespacing*{\subsection}{0pt}{8pt}{4pt}
+\titleformat{\subsubsection}{\normalsize\bfseries\itshape}{}{0em}{}
+\titlespacing*{\subsubsection}{0pt}{6pt}{3pt}
+\setlist[itemize]{nosep, leftmargin=1.4em, label=\textbullet, topsep=2pt}
+\setlist[enumerate]{nosep, leftmargin=1.8em, topsep=2pt}
+
+\lstset{
+  language=Python,
+  basicstyle=\small\ttfamily,
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!50!black},
+  stringstyle=\color{red!60!black},
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+  aboveskip=6pt,
+  belowskip=6pt,
+}
+
+\begin{document}
+
+\begin{titlepage}
+\centering
+\vspace*{3cm}
+{\Huge\bfseries RL at Scale}\\[1cm]
+{\Large A Practical Guide to Reinforcement Learning\\for Frontier AI Systems}\\[2cm]
+{\large Amiya Diwan}\\[1cm]
+{\today}
+\vfill
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\part{Study Guide}
+
+\input{studyguide/01-research-taste}
+\input{studyguide/02-rl-foundations}
+\input{studyguide/03-scaling-and-alignment}
+\input{studyguide/04-interview-tactics}
+\input{studyguide/05-deep-dives}
+\input{studyguide/06-reference-appendix}
+
+\part{Workbook}
+
+\input{workbook/01-amd-benchmarking}
+\input{workbook/02-cuda-kernels}
+\input{workbook/03-tpu-pallas}
+\input{workbook/04-inference-serving}
+\input{workbook/05-distributed-training}
+\input{workbook/06-policy-gradients}
+\input{workbook/07-tinyrl-pipeline-scaling}
+\input{workbook/08-synthesis}
+
+\end{document}
