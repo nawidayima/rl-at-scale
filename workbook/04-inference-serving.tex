@@ -1,0 +1,284 @@
+\section{RL Inference \& Serving Efficiency}
+
+\smallskip\noindent\textit{Study Guide companion: Study Guide Section 9 (Questions That Show Depth --- Hardware \& Generation Bottleneck) covers the interview-ready version of this material.}
+\smallskip
+
+\begin{whythis}
+Dario Amodei put it plainly: ``This isn't a research problem. This is an engineering and inference problem.'' RLVR training runs last weeks, and 50--70\% of that wall time is spent on autoregressive token generation --- not on gradient computation, not on optimizer updates, but on the forward pass that produces rollouts. A 2$\times$ speedup in matmul kernels might recover a few percent of overall runtime. A 2$\times$ speedup in generation throughput cuts your training time nearly in half.
+
+The asymmetry matters for compounding reasons. Every gradient step requires a fresh batch of rollouts. If rollout generation takes 5 minutes and the gradient step takes 1 minute, you run 6-minute cycles for weeks. Halve generation time and you run 3.5-minute cycles --- not 2$\times$ faster overall, but 1.7$\times$ faster, which over a 3-week run is 6 days of recovered wall time per run. Across dozens of experiments, that is months.
+
+This chapter is hardware-agnostic. The techniques here --- paged attention, speculative decoding, continuous batching, MoE serving, fused sampling kernels, mixed-precision stability --- apply on H100s, MI300Xs, TPUs, and whatever comes next. Chapters 1--3 benchmark these on specific hardware. Here we build the conceptual and quantitative toolkit for understanding \textit{why} each technique exists and when it helps.
+\end{whythis}
+
+% -----------------------------------------------------------------------
+\subsection{KV Cache Management}
+% -----------------------------------------------------------------------
+
+Every autoregressive generation step recomputes attention over all previous tokens unless the key-value projections are cached. KV caching is the dominant technique for making generation efficient: each new token attends to cached KV tensors from previous positions rather than recomputing from scratch. The cost is memory: for a model with $L$ layers, $H$ attention heads, head dimension $d$, batch size $B$, and sequence length $S$, the KV cache occupies:
+
+$$\text{KV memory} = 2 \times L \times H \times d \times S \times B \times \text{bytes\_per\_element}$$
+
+The factor of 2 is for keys and values. At FP16 (2 bytes), a 70B model with 80 layers, 64 heads, head dimension 128, batch 32, context 4096 tokens occupies roughly 54 GB --- most of an H100's 80 GB just for the cache.
+
+\textbf{Paged attention.} The naive approach allocates a contiguous memory block per sequence at the maximum possible length. On variable-length sequences (the RLVR case, where completions range from 100 to 2000+ tokens), this wastes HBM proportionally to the gap between actual and maximum length. vLLM's paged attention instead manages KV cache as fixed-size \textit{blocks} (analogous to OS virtual memory pages), allocated on demand and mapped to non-contiguous physical memory. Fragmentation drops from $O(S_\text{max})$ to $O(\text{block size})$ per sequence. For RLVR with high length variance, this directly increases the number of concurrent rollouts that fit in memory.
+
+\textbf{KV cache quantization.} FP8 or INT8 quantization of the KV cache reduces memory by 2--4$\times$ at the cost of quantization noise in attention scores. For supervised training, this noise is generally tolerable. For RLVR, the generation quality directly determines the reward signal, which directly determines the gradient. A question worth taking seriously: is KV quantization noise tolerable for RL? The answer is empirical and workload-dependent. Short-horizon tasks with binary rewards (correct/incorrect) may be insensitive to small attention noise. Long chain-of-thought generation, where a subtle early error compounds over 2000 tokens, may see meaningful reward degradation. Measure before deploying.
+
+\textbf{Eviction and compression for long-context rollouts.} When the KV cache exceeds available memory, three strategies exist:
+\begin{itemize}
+  \item \textbf{Eviction:} Drop KV entries for positions that are least recently used or received low attention weight. Simple and fast but permanently loses context. Appropriate when the task does not require long-range dependencies.
+  \item \textbf{Compression:} Retain ``attention sink'' tokens (the first few tokens, which accumulate disproportionate attention weight) plus a sliding recent window. StreamingLLM demonstrated that this maintains generation quality on long documents far beyond training context length.
+  \item \textbf{Offloading:} Spill KV cache to CPU DRAM (typically 512--2048 GB on a modern server). Bandwidth-limited: PCIe 5.0 delivers around 64 GB/s, versus HBM3's 3.35 TB/s. Offloading is viable only when the CPU-side data is accessed infrequently --- for example, prompt KV that was computed once and is shared across all $G$ completions in a GRPO group.
+\end{itemize}
+
+\textbf{MoE memory interaction.} Dario Amodei confirmed Anthropic is training MoE models. The memory budget per GPU has three major competing consumers: (1) dense model weights (embedding, attention projections, layer norms), (2) expert weights (each expert is a separate FFN; with $E$ experts and $k$ active per token, only $k$ are used per forward pass but all $E$ must reside somewhere), and (3) the KV cache. On a sharded MoE deployment, expert weights may be sharded across GPUs, so each GPU holds $E / \text{num\_gpus}$ experts. But the KV cache is local --- each GPU caches the keys and values for the sequences it is processing. The three-way tradeoff is unavoidable: larger experts, longer context, or larger batch --- not all three.
+
+\begin{thinkfirst}{MoE Memory Budget (no computer)}
+You have a 70B MoE model with 8 experts (2 active per token) on 8 GPUs with 80 GB each. Draw the memory budget per GPU: dense model weights, expert weights (sharded across GPUs), KV cache, activations, and optimizer states.
+
+Work through the numbers. Assume the 70B parameter count is split roughly 30B in dense components (embeddings, attention) and 40B in expert FFN weights across all 8 experts. Each expert holds 5B parameters; sharded across 8 GPUs, each GPU holds $5\text{B} / 8 \approx 0.625\text{B}$ expert parameters --- but it also needs all 8 experts' weights for routing, so expert weights per GPU are the full $8 \times 0.625\text{B} = 5\text{B}$ if not sharded, or $0.625\text{B}$ per GPU if expert-parallelism is used. Clarify which model parallelism strategy you are assuming.
+
+At what context length does the GPU OOM? Show the arithmetic for FP16 weights and FP16 KV cache at batch size 16, varying context from 1K to 16K tokens.
+
+Now redo the same analysis for an MI300X with 192 GB HBM. The extra 112 GB per GPU --- where does it go? Is it better invested in more context (longer rollouts without eviction), larger batch size (more parallel completions, higher GPU utilization), or in fitting a larger model without tensor parallelism overhead?
+
+There is no single right answer. The point is to make explicit which constraint is binding and how extra memory relaxes it.
+\end{thinkfirst}
+
+% -----------------------------------------------------------------------
+\subsection{Speculative Decoding for RLVR Rollouts}
+% -----------------------------------------------------------------------
+
+Speculative decoding is an exact-or-approximate method for accelerating autoregressive generation using a small \textit{draft model} that proposes $K$ tokens in parallel, followed by a single forward pass of the large \textit{target model} that verifies all $K$ proposals simultaneously. The key insight: a forward pass through the large model at sequence length $K+1$ costs roughly the same as a forward pass at sequence length 1 (for large models, the dominant cost is parameter loading from HBM, not flops) --- so if even one draft token is accepted, the effective throughput increases.
+
+\textbf{Acceptance rate and breakeven.} Let $\alpha \in [0,1]$ be the per-token acceptance rate (the probability that the draft model's proposed token matches what the target would have sampled). The expected number of tokens produced per target forward pass is:
+
+$$\mathbb{E}[\text{tokens per pass}] = K\alpha + 1$$
+
+The $+1$ accounts for the one token the target always produces (either accepting the draft's final token or generating a correction). Standard autoregressive produces exactly 1 token per target forward pass. Speculative decoding is beneficial when:
+
+$$K\alpha + 1 > 1 \implies \alpha > 0$$
+
+But this ignores the cost of draft generation. Let the draft model cost $c_d$ per token and the target model cost $c_t$ per token (with $c_d \ll c_t$). The cost per $K$ draft tokens is $K c_d$. The cost of one target verification pass is $c_t$. Total cost to produce $K\alpha + 1$ tokens: $K c_d + c_t$. Standard autoregressive cost for $K\alpha + 1$ tokens: $(K\alpha + 1) c_t$. Speculative decoding wins when:
+
+$$K c_d + c_t < (K\alpha + 1) c_t \implies K c_d < K\alpha \cdot c_t \implies \frac{c_d}{c_t} < \alpha$$
+
+The breakeven acceptance rate is $\alpha^* = c_d / c_t$. If the draft model is 10$\times$ cheaper than the target, speculative decoding wins for $\alpha > 0.1$.
+
+\textbf{The RLVR problem: a moving target.} In RLVR, the target model IS the policy being trained. Its distribution shifts every gradient update. The draft model, typically distilled from the target at initialization, approximates target step 0. At step 1000, the policy may have diverged substantially --- especially in reasoning models, where the chain-of-thought distribution changes as the model learns to solve harder problems. Acceptance rate $\alpha$ degrades monotonically with policy divergence (in general). At some training step $t^*$, $\alpha$ falls below the breakeven threshold and speculative decoding stops helping --- or actively hurts throughput due to the overhead of draft generation and verification.
+
+\textbf{Re-distillation frequency.} The practical question is: how often must you re-distill the draft model to maintain $\alpha > \alpha^*$? This depends on the KL divergence between draft and target distributions, which in turn depends on the reward signal magnitude and learning rate. There is no closed-form answer; it must be measured experimentally. The exercise in this chapter builds that measurement.
+
+\textbf{An elegant approach.} The previous RLVR checkpoint is itself an approximation of the current policy --- and re-distillation is free, since you already have the checkpoint. Using checkpoint $t-k$ as the draft model for checkpoint $t$ gives speculative decoding whose acceptance rate depends on how much the policy shifts in $k$ steps. This is the self-speculative decoding regime for RLVR. The open research question: at what checkpoint gap $k$ does acceptance rate fall below breakeven? Can you adapt $k$ dynamically based on measured KL divergence?
+
+\begin{thinkfirst}{Speculative Decoding Breakeven Math}
+Work through the following carefully before continuing.
+
+\textbf{Part 1: Basic breakeven.} Draft model has acceptance rate $\alpha$ per token. Each draft step proposes $K$ tokens. The expected number of tokens produced per target forward pass is $K\alpha + 1$ (derive this from first principles using the geometric distribution of how many consecutive tokens are accepted before the first rejection). At what $\alpha$ and $K$ does speculative decoding beat standard autoregressive, assuming the draft model is free? Now add the draft cost: if the draft model is $1/r$ the cost of the target, what is the minimum $\alpha$ as a function of $K$ and $r$?
+
+\textbf{Part 2: Distributional shift.} The target model is being RLVR-trained and its distribution shifts every update. The draft model was distilled from the target at step 0. Consider two extreme cases:
+
+(a) The target learns to prefer a completely different vocabulary for chain-of-thought (e.g., it switches from English reasoning to symbolic reasoning). What happens to $\alpha$? What is the minimum $\alpha$ in the worst case?
+
+(b) The target shifts gradually --- each update moves the distribution by KL divergence $\delta$. If $\alpha$ degrades linearly with cumulative KL divergence (a simplifying assumption), at what training step does speculative decoding stop helping?
+
+\textbf{Part 3: Re-distillation strategy.} The draft model was distilled from the target at step 0 and costs $C_\text{distill}$ to re-distill. Speculative decoding provides a throughput gain of $g(\alpha)$ tokens/second. Re-distillation is worthwhile when the throughput gain integrated over the next $\Delta t$ steps exceeds $C_\text{distill}$. Derive the optimal re-distillation interval as a function of $\alpha$'s decay rate, $g(\cdot)$, and $C_\text{distill}$.
+\end{thinkfirst}
+
+% -----------------------------------------------------------------------
+\subsection{Continuous Batching Under RLVR}
+% -----------------------------------------------------------------------
+
+RLVR rollout generation has an extreme length distribution. A single GRPO training step generates $G$ completions per prompt (typically $G = 8$--$32$) for each of $B$ prompts in the batch, producing $G \times B$ concurrent sequences. For reasoning-capable models solving math or coding problems, sequence lengths follow a heavy-tailed distribution: many completions finish quickly (100--300 tokens for easy problems), while hard problems produce extended chains of thought (1000--4000 tokens). The ratio of $\ell_\text{max} / \ell_\text{mean}$ can exceed 10:1.
+
+\textbf{Static batching waste.} The naive strategy pads all sequences to the maximum length in the batch and runs them to completion simultaneously. For a batch where 90\% of sequences are 200 tokens and 10\% are 2000 tokens, static batching computes 10$\times$ as many tokens as needed for the short sequences --- and 90\% of GPU cycles in the tail are wasted on padding. At GRPO's scale, this is not a minor inefficiency; it can dominate GPU utilization metrics.
+
+\textbf{Continuous/dynamic batching.} The fix is to insert new sequences into the running batch as old ones finish, rather than waiting for the entire batch to complete. This is the core technique in vLLM, TGI, and similar serving systems. The GPU is kept busy with real work rather than padding operations. Throughput increases proportionally to how much time was previously wasted.
+
+\textbf{The RLVR synchronization barrier.} Continuous batching across independent requests is straightforward. RLVR adds a constraint: all $G$ completions for a single prompt must complete before advantage computation can proceed. The advantage $\hat{A}_i$ for completion $i$ is computed relative to the mean reward across all $G$ completions for that prompt:
+
+$$\hat{A}_i = \frac{r_i - \mu_G}{\sigma_G}$$
+
+where $\mu_G$ and $\sigma_G$ are the mean and standard deviation of rewards within the group. You cannot compute $\mu_G$ until all $G$ completions are finished. This creates a \textit{prompt group} abstraction: a group of $G$ sequences that must be synchronized before the gradient step.
+
+\textbf{Batching strategy.} The recommended approach is to batch \textit{across} prompt groups while maintaining per-group synchronization. Concretely:
+\begin{enumerate}
+  \item Assign each incoming prompt a group ID. Launch all $G$ completions for that prompt simultaneously.
+  \item Maintain a per-group completion counter. When a completion finishes, increment the counter.
+  \item When a group's counter reaches $G$, mark the group as ready for advantage computation.
+  \item Free the memory for all $G$ sequences in that group and immediately schedule a new prompt group.
+\end{enumerate}
+
+This gives continuous batching across groups (memory is recycled promptly) while preserving the intra-group synchronization needed for GRPO. The key insight: you do not need to wait for all groups to finish --- only for each individual group. Long-running groups can coexist with short groups in the same batch.
+
+\begin{thinkfirst}{GRPO Batching Scenario}
+GRPO with $G = 16$ completions per prompt, batch of 32 prompts. That is 512 concurrent generations. RLVR models produce extended chain-of-thought (100--2000 tokens). Some finish in 100 tokens, some in 2000.
+
+\textbf{Scenario 1: Static batching.} All 512 sequences are padded to 2000 tokens. Compute the number of wasted token-forward-passes if the true length distribution is uniform on $[100, 2000]$. Express this as a fraction of total compute.
+
+\textbf{Scenario 2: Dynamic batching without group awareness.} New sequences are inserted as old ones finish, ignoring prompt group membership. A group with 15/16 completions done but one slow outlier (2000 tokens) is stranded --- advantage computation cannot proceed. How do you handle this? What are the tradeoffs between waiting for the outlier versus dropping it?
+
+\textbf{Scenario 3: Group-aware batching.} Implement the group abstraction described above. When does the synchronization barrier dominate? At $G = 4$ versus $G = 64$, how does the distribution of group completion times change (assume i.i.d. completion lengths within a group)? At what $G$ does the expected wait for the slowest completion in a group become the binding constraint on throughput?
+
+Design a batching strategy that handles the RLVR synchronization constraint without significant padding waste. Identify the scheduling decisions: which groups to run concurrently, how to handle stragglers, how to bound memory usage.
+\end{thinkfirst}
+
+% -----------------------------------------------------------------------
+\subsection{MoE Serving Patterns}
+% -----------------------------------------------------------------------
+
+Mixture-of-Experts models replace the dense FFN in each transformer layer with $E$ parallel expert FFNs, routing each token to the top-$k$ experts via a learned gating function. For generation, this introduces communication overhead that does not exist in dense models.
+
+\textbf{All-to-all per token.} At each transformer layer during generation, the routing decision must be made and tokens dispatched to the appropriate expert. In a distributed MoE setting where experts are sharded across GPUs (expert parallelism), each token's computation requires an all-to-all communication: send token representations from their current GPU to the GPU holding the selected expert, compute the expert FFN, and send results back. For a single token step, this is two all-to-all operations per MoE layer. For a model with $L/2$ MoE layers (alternating dense and MoE, a common design), that is $L$ all-to-all operations per autoregressive step. At generation batch sizes of hundreds of sequences, this communication can dominate step latency.
+
+\textbf{Expert caching.} In practice, token routing is not uniform. A given model tends to send similar tokens to similar experts --- the routing function is deterministic given the hidden state. For a fixed prompt distribution, a small number of ``hot'' experts handle a disproportionate share of tokens. Expert caching exploits this: keep the hot experts in faster memory (HBM or L2 cache), evict cold experts. At inference time with a static prompt distribution, expert caching can reduce effective all-to-all volume by 2--5$\times$. Under RLVR, the prompt distribution shifts as the policy learns, so hot experts shift over time --- caching must adapt.
+
+\textbf{Load balancing under RLVR.} MoE models use an auxiliary load-balancing loss to prevent expert collapse (where all tokens route to a single expert, wasting $E-1$ experts). Under RLVR training, the routing patterns change as the policy update shifts the hidden state distribution. This creates dynamic load imbalance: at some training steps, the load-balancing loss has not yet corrected for the new routing distribution, and some GPUs holding cold experts are idle while others are saturated. Monitoring per-expert load variance during RLVR training is a useful diagnostic for whether expert capacity is a throughput bottleneck.
+
+% -----------------------------------------------------------------------
+\subsection{Sampling Kernels}
+% -----------------------------------------------------------------------
+
+At each generation step, after the forward pass computes logits over the vocabulary, sampling requires: (1) divide logits by temperature, (2) compute softmax, (3) apply top-$k$ or top-$p$ filtering, (4) sample from the resulting distribution. These steps are often implemented as separate GPU kernel launches, each requiring a round-trip through HBM. For large vocabulary sizes (32K--256K tokens), this overhead is measurable.
+
+\textbf{Fused sampling kernel.} A single fused kernel that performs temperature scaling, softmax, top-$k$ filtering, and multinomial sampling in one pass eliminates intermediate HBM reads and writes. The speedup depends on vocabulary size: for small vocabularies (32K), the softmax computation is fast and HBM bandwidth is not the bottleneck. For large vocabularies (256K, as in modern multilingual models), the softmax over the full vocabulary requires reading and writing 512 KB per sequence per step (at FP16), and kernel fusion provides 10--30\% latency reduction on this step. As a fraction of total generation time for a 7B model, sampling is typically 5--15\% --- not the dominant cost, but not negligible across weeks of training.
+
+\textbf{Temperature scheduling during RLVR.} The sampling temperature controls exploration versus exploitation during rollout generation. A natural schedule is high temperature early in training (when the policy is uncertain and exploration is valuable) ramping down to low temperature as the policy converges (to reduce variance in the reward signal). This is analogous to $\epsilon$-annealing in DQN. Implementing temperature as a dynamic parameter in the sampling kernel (rather than a compile-time constant) is a systems detail that matters for RLVR workflows where temperature changes every few hundred gradient steps.
+
+\textbf{Rejection sampling and best-of-$N$.} A common alternative to temperature-based exploration is best-of-$N$: generate $N$ completions, score them all with the reward model, and keep the highest-scoring one for training (or for final output at inference time). The naive implementation generates all $N$ completions before scoring any. An early-exit optimization scores completions as they finish and terminates generation for remaining sequences once a sufficiently high-scoring sample is found --- reducing average generation length at the cost of some suboptimality (the best completion might have been among the ones terminated early). For RLVR training where you need the \textit{distribution} of completions (not just the best), best-of-$N$ with early exit is less applicable, but it matters for evaluation and deployment.
+
+% -----------------------------------------------------------------------
+\subsection{Numerical Stability in Mixed Precision (Dario's Factors 6--7)}
+% -----------------------------------------------------------------------
+
+Dario Amodei's ``Big Blob'' framework for frontier model training identifies numerical stability --- ``laminar flow of gradients'' --- as a first-class engineering concern, not an afterthought. Factors 6 and 7 in his framework emphasize that precision choices affect training stability in ways that interact with the optimizer, the architecture, and the loss signal.
+
+\textbf{The precision stack.} Modern RLVR training operates at multiple precision levels simultaneously:
+\begin{itemize}
+  \item \textbf{Weights:} BF16 or FP8, depending on hardware support and stability requirements. FP8 weights halve memory versus BF16 at the cost of a smaller dynamic range.
+  \item \textbf{Activations:} BF16 for most operations. FP32 for numerically sensitive operations (softmax, layer norm, loss computation).
+  \item \textbf{KV cache:} As discussed above, FP8 or INT8 reduces memory. The precision here affects generation quality, not the backward pass.
+  \item \textbf{Gradient accumulation:} FP32 is standard. Accumulating gradients in BF16 introduces rounding errors that compound over micro-batches. At large gradient accumulation counts (common in RLVR where the effective batch size must be large for stable advantage estimates), BF16 gradient accumulation can cause silent training instabilities.
+  \item \textbf{Optimizer states:} FP32 for Adam first and second moments. This is the largest memory cost in the optimizer --- twice the model size in FP32. Mixed-precision optimizers (e.g., bf16 master weights with fp32 moments) reduce this.
+\end{itemize}
+
+\textbf{RL gradients are different.} In supervised learning, gradient noise from quantization is small relative to the signal --- the loss function is well-conditioned. Policy gradient estimates are inherently high-variance: the gradient is $\nabla_\theta \log \pi_\theta(a|s) \cdot \hat{A}$, and $\hat{A}$ can be large and variable. Quantization noise in FP8 activations adds an additional stochastic perturbation on top of this already-noisy estimator. The concern is not that FP8 always breaks RL training --- it may be fine in practice. The concern is that the failure mode is silent: training appears to proceed, rewards increase, but at a slower rate or with higher variance than BF16 would achieve. Without a BF16 baseline to compare against, you would not know. The recommendation is to run short ablations comparing FP8 and BF16 activation precision early in a new RLVR setup, before committing to a weeks-long run.
+
+\textbf{Softmax overflow in long-context generation.} At context lengths of 4000+ tokens, attention logits can overflow FP16 (max value $\approx 65504$). The standard fix is to compute attention in FP32 (or use Flash Attention's online softmax, which avoids materializing the full logit matrix). Overflow in the attention softmax causes the generation distribution to collapse to the argmax --- equivalent to zero-temperature sampling --- which destroys exploration in RLVR. This is a correctness issue, not just a precision tradeoff.
+
+% -----------------------------------------------------------------------
+\subsection{Exercises}
+% -----------------------------------------------------------------------
+
+\begin{exercise}{KV Cache Budget Calculator (2--3 hours)}
+Build a Python tool that computes memory budgets for transformer (including MoE) models.
+
+\textbf{Inputs:}
+\begin{itemize}
+  \item Model config: number of parameters, number of layers, hidden dimension, number of heads, head dimension
+  \item MoE config: number of experts, experts per token (active experts)
+  \item Precision config: dtype for weights (FP16/BF16/FP8), KV cache dtype (FP16/FP8/INT8), activation dtype
+  \item Hardware: GPU memory in GB, number of GPUs (for tensor/expert parallelism)
+\end{itemize}
+
+\textbf{Outputs:}
+\begin{itemize}
+  \item Memory breakdown: dense weights, expert weights (per GPU given expert parallelism), KV cache at given batch/context, activations, optimizer states
+  \item Maximum context length given a fixed batch size (solve for $S$ such that total memory $\leq$ GPU memory)
+  \item Maximum batch size given a fixed context length
+  \item Utilization \% (what fraction of GPU memory is used by each component)
+\end{itemize}
+
+\textbf{Required runs:} H100 SXM5 (80 GB), MI300X (192 GB), TPU v5e (16 GB HBM per chip). For the TPU, use model parallelism across 4 chips.
+
+\textbf{Deliverable:} A table comparing all three hardware targets for a 7B dense model and a 70B MoE model (8 experts, 2 active), at batch size 16 and context 4096, with FP16 weights and FP16 KV. Annotate which component is the binding constraint on each platform.
+\end{exercise}
+
+\begin{exercise}{Speculative Decoding Prototype (4--6 hours)}
+Implement speculative decoding for GPT-2 small (117M, draft) + GPT-2 medium (345M, target) using HuggingFace. GPT-2 small is approximately $1/3$ the compute cost of GPT-2 medium --- use this as a proxy for the draft/target cost ratio.
+
+\textbf{Part 1: Baseline measurement.}
+\begin{enumerate}
+  \item Implement standard autoregressive generation for GPT-2 medium. Measure tokens/second.
+  \item Implement speculative decoding with draft length $K \in \{1, 2, 4, 8, 16\}$. For each $K$, measure: (a) empirical acceptance rate $\alpha$, (b) tokens/second, (c) speedup ratio vs autoregressive.
+  \item Plot speedup vs $K$. Identify the $K$ that maximizes speedup. Does it match the theoretical prediction from Part 1 of the Think First box?
+\end{enumerate}
+
+\textbf{Part 2: Distributional shift under RLVR.}
+\begin{enumerate}
+  \item RLVR-train GPT-2 medium for 200 PPO steps on a simple reward (e.g., reward for generating text that contains a specific word or matches a pattern). Keep GPT-2 small fixed as the draft model.
+  \item Every 20 training steps, measure the acceptance rate $\alpha$ between the current GPT-2 medium and the fixed GPT-2 small draft.
+  \item Plot $\alpha$ vs training step. Find $t^*$: the step at which $\alpha$ falls below the breakeven threshold. Compute the breakeven threshold from the cost ratio.
+  \item Repeat with the draft model updated every 50 steps (re-distillation via copying weights + fine-tuning). Does periodic update maintain $\alpha$ above breakeven?
+\end{enumerate}
+
+\textbf{Deliverable:} The degradation curve $\alpha(t)$ is the core artifact. Write a paragraph interpreting it: at what training phase does speculative decoding help most, and what does this imply for production RLVR systems?
+\end{exercise}
+
+\begin{exercise}{Variable-Length Batching Simulator (3--4 hours)}
+No GPU required --- pure Python simulation. This exercise builds intuition for how batching strategy interacts with the GRPO synchronization constraint.
+
+\textbf{Setup.} Simulate 1000 RLVR rollouts. Length distribution: log-normal with $\mu = 6$, $\sigma = 1$ (mean $\approx 403$ tokens, with heavy right tail extending to 2000+ tokens). Group size $G = 16$. Total prompts: 1000~/$G$ = 62 groups, each with 16 completions.
+
+\textbf{Simulate three strategies:}
+\begin{enumerate}
+  \item \textbf{Static batching:} Pad all sequences in a batch to the maximum length. Batch size fixed at 64 sequences. Measure: total token-steps computed, wasted token-steps (padding), effective GPU utilization (real tokens / total tokens), wall time (proportional to total token-steps), peak memory (batch size $\times$ max length).
+  \item \textbf{Dynamic batching per prompt group:} Each group of $G = 16$ completions is processed together, but sequences within the group are not padded to global max --- only to the group's max. New groups start when all 16 completions in the current group finish. Measure same metrics.
+  \item \textbf{Fully continuous batching across groups:} Sequences are inserted and removed individually as they finish. The only constraint: advantage computation for a group is triggered when the group's $G$-th completion finishes. Measure same metrics.
+\end{enumerate}
+
+\textbf{Analysis:}
+\begin{itemize}
+  \item Which strategy wins on each metric? Is there a single winner, or is there a Pareto frontier?
+  \item At what group size $G \in \{4, 8, 16, 32, 64\}$ does the synchronization barrier dominate throughput? Plot expected group completion time (= max of $G$ i.i.d. samples from the log-normal) vs $G$.
+  \item What is the 95th percentile completion time for a group at $G = 16$? What does this imply for tail latency in production?
+\end{itemize}
+
+\textbf{Deliverable:} A table of utilization \%, wall time, and memory peak for all three strategies at $G \in \{8, 16, 32\}$. A one-paragraph capacity planning recommendation for an RL team choosing a batching strategy.
+\end{exercise}
+
+\begin{exercise}{Sampling Kernel Fusion (2--3 hours)}
+Implement and benchmark fused vs.\ unfused sampling.
+
+\textbf{Part 1: Implementation.}
+\begin{enumerate}
+  \item \textbf{Unfused baseline:} In PyTorch, implement the sampling pipeline as separate operations: \texttt{logits / temperature} $\to$ \texttt{torch.softmax} $\to$ top-$k$ masking $\to$ \texttt{torch.multinomial}. Time each operation separately.
+  \item \textbf{Fused with \texttt{torch.compile}:} Wrap the entire pipeline in \texttt{torch.compile()} with \texttt{mode="reduce-overhead"}. Measure end-to-end latency.
+  \item \textbf{Custom kernel (stretch):} Implement a Triton kernel that performs all four steps in a single pass. Compare to \texttt{torch.compile} performance.
+\end{enumerate}
+
+\textbf{Part 2: Scaling analysis.} Measure latency at vocab sizes $V \in \{32768, 50257, 65536, 131072, 256000\}$, batch sizes $\{1, 16, 64, 256\}$. For each $(V, \text{batch size})$ pair, compute:
+\begin{itemize}
+  \item Absolute latency (ms) for fused and unfused
+  \item Speedup ratio = unfused / fused
+  \item Theoretical roofline: is this operation memory-bandwidth-bound or compute-bound?
+\end{itemize}
+
+\textbf{Part 3: Generation time fraction.} For a 7B model generating at batch size 64, estimate what fraction of total per-step wall time is spent on sampling. Use your latency measurements to compute this. At what model size does sampling become negligible ($< 1\%$ of step time)?
+
+\textbf{Deliverable:} A heatmap of speedup ratio across $(V, \text{batch size})$. Annotation of the crossover point where fusion provides $> 10\%$ speedup. A calculation of the sampling fraction for representative model sizes.
+\end{exercise}
+
+\begin{portfolio}{RL Inference Efficiency Guide}
+Write a technical blog post with real measurements titled ``RL Inference Efficiency: KV Cache, Speculative Decoding, and Batching for GRPO-Scale Training.''
+
+\textbf{Required sections:}
+\begin{enumerate}
+  \item \textbf{KV Cache Management:} Present your memory budget calculator results. Show the per-platform breakdown table. Explain which component is the binding constraint on each hardware target and what practitioners should do about it.
+  \item \textbf{Speculative Decoding Under Distributional Shift:} Present the $\alpha(t)$ degradation curve. This is the monkey --- the measurement that requires building something and interpreting a result. Describe: (a) the speedup at training step 0, (b) the crossover point $t^*$ where speculative decoding stops helping, (c) the practical implication for production RLVR systems (when to use spec dec, when to abandon it, whether periodic re-distillation is worth the cost).
+  \item \textbf{Batching Strategies for GRPO Rollouts:} Present your simulator results. Give the actionable capacity planning recommendation: for a team running GRPO with $G = 16$ on a cluster of H100s, what batching strategy should they use, and why?
+\end{enumerate}
+
+\textbf{The monkey.} ``How does speculative decoding's acceptance rate degrade when the target model is being RLVR-trained, and what is the practical implication for training throughput?'' Building the prototype (Exercise 2) is the pedestal. The degradation curve and the concrete recommendation (``use spec dec for the first $N$ gradient steps, then switch to standard autoregressive, re-distill every $M$ steps if you want to extend the benefit'') is the monkey. The blog post is not complete without a number for $N$ and a recommendation for $M$ grounded in your measurements.
+
+\textbf{Verification checklist:}
+\begin{enumerate}
+  \item Speculative decoding shows measurable throughput speedup at training step 0 (at least $1.3\times$ for $K = 4$, $\alpha \geq 0.5$ on natural language).
+  \item The degradation curve $\alpha(t)$ has a concrete crossover point $t^*$ that you can identify from your measurements.
+  \item The batching simulator produces a utilization table that an RL team could use for capacity planning (numbers are in the right ballpark for real RLVR workloads).
+  \item The blog post is written for a technical audience (ML engineers) and contains enough implementation detail that a reader could reproduce your measurements.
+\end{enumerate}
+\end{portfolio}
+
+\newpage

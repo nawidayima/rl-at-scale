@@ -1,0 +1,284 @@
+\section{Policy Gradient --- Hypothesis-Driven Depth}
+
+\smallskip\noindent\textit{Study Guide companion: Study Guide Section 2 (RL for LLMs) covers the conversational, interview-ready version of this material.}
+\smallskip
+
+\begin{whythis}
+There is a deep mathematical insight about what policy gradient is \textit{truly} doing --- an unlock that changes how you think about algorithm design for RLVR. This chapter does not guess the answer. Guessing is a trap: you pick your favorite theory, confirm it, and stop looking.
+
+Instead, this chapter builds the more durable skill: \textit{generating hypotheses, deriving their predictions, and designing experiments that could falsify them}. Six candidate ``unlocks'' are developed here, each with a concrete prediction and a minimal experiment. Some will be wrong. The point is the discipline.
+
+The right posture is not ``I know the secret.'' It is: ``I have been attacking this problem systematically. Here are the hypotheses I have generated, the predictions I have derived, and the experiments I have designed to test them. Here is where the evidence points --- and here is what would change my mind.'' That is the research taste Anthropic is hiring for.
+\end{whythis}
+
+% -----------------------------------------------------------------------
+\subsection{Foundation: Policy Gradient from First Principles}
+% -----------------------------------------------------------------------
+
+\begin{thinkfirst}{Policy Gradient Theorem --- Two Derivations}
+Work both derivations on paper before reading further. The goal is to understand not just the formula but which assumptions each derivation requires --- because those assumptions determine where each estimator breaks down.
+
+\textbf{Derivation 1: Score Function Estimator (Log-Derivative Trick).}
+
+The objective is $J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}[R(\tau)]$, where $\tau = (s_0, a_0, s_1, a_1, \ldots)$ is a trajectory. Expand the expectation as an integral over trajectory distributions:
+\begin{align*}
+  J(\theta) &= \int p_\theta(\tau) R(\tau) \, d\tau
+\end{align*}
+
+Differentiate under the integral sign (valid when $p_\theta(\tau)$ is differentiable in $\theta$ and the reward is bounded):
+\begin{align*}
+  \nabla_\theta J(\theta) &= \int \nabla_\theta p_\theta(\tau) \cdot R(\tau) \, d\tau
+\end{align*}
+
+Apply the log-derivative identity $\nabla_\theta p_\theta(\tau) = p_\theta(\tau) \nabla_\theta \log p_\theta(\tau)$:
+\begin{align*}
+  \nabla_\theta J(\theta) &= \int p_\theta(\tau) \nabla_\theta \log p_\theta(\tau) \cdot R(\tau) \, d\tau = \mathbb{E}_{\pi_\theta}\!\left[\nabla_\theta \log \pi_\theta(\tau) \cdot R(\tau)\right]
+\end{align*}
+
+Since $\log p_\theta(\tau) = \sum_t \log \pi_\theta(a_t | s_t) + \text{const}$ (the environment dynamics cancel):
+\begin{align*}
+  \nabla_\theta J(\theta) &= \mathbb{E}_{\pi_\theta}\!\left[\sum_t \nabla_\theta \log \pi_\theta(a_t|s_t) \cdot R(\tau)\right]
+\end{align*}
+
+Key property: this estimator is unbiased. It requires only the ability to \textit{sample} from $\pi_\theta$ and evaluate $\log \pi_\theta(a|s)$ --- the reward function does not need to be differentiable. This makes it applicable to discrete action spaces.
+
+\textbf{Derivation 2: Reparameterization Trick (Continuous Actions).}
+
+When $\pi_\theta(a|s)$ is a distribution with a differentiable sampling procedure, write $a = f_\theta(s, \epsilon)$ where $\epsilon \sim p(\epsilon)$ is a noise source independent of $\theta$. Then:
+\begin{align*}
+  J(\theta) &= \mathbb{E}_{\epsilon \sim p(\epsilon)}\!\left[R(f_\theta(s, \epsilon))\right]
+\end{align*}
+
+Now $\theta$ enters inside the function, so:
+\begin{align*}
+  \nabla_\theta J(\theta) &= \mathbb{E}_{\epsilon}\!\left[\nabla_\theta R(f_\theta(s, \epsilon))\right] = \mathbb{E}_{\epsilon}\!\left[\frac{\partial R}{\partial a} \cdot \frac{\partial f_\theta}{\partial \theta}\right]
+\end{align*}
+
+The gradient flows directly through the sample. This has lower variance than the score function estimator because it uses derivative information about how the return changes with the action, rather than only weighting samples by their return.
+
+\textbf{Variance comparison.} The score function estimator's variance is $O(R^2)$ --- it scales with the squared magnitude of the return signal. For high-return trajectories in RLVR (long reasoning traces), this variance can be enormous. The reparameterization estimator's variance depends on $\|\partial R / \partial a\|$ --- the sensitivity of the reward to action perturbations --- which can be much smaller. However, reparameterization requires: (1) continuous actions, (2) a differentiable reward function $R(a)$, (3) a differentiable sampling function $f_\theta$. In RLVR with discrete token generation and deterministic verifier rewards, none of these hold. You are stuck with the score function estimator. Understanding \textit{why} is the insight.
+\end{thinkfirst}
+
+\begin{thinkfirst}{The Optimal Baseline}
+The score function estimator has high variance. A standard trick is to subtract a \textit{baseline} $b(s)$ from the return before forming the gradient estimate. Prove that this is unbiased, then derive the optimal baseline.
+
+\textbf{Unbiasedness proof.} For any state-dependent function $b(s)$, show that:
+\begin{align*}
+  \mathbb{E}_{\pi_\theta}\!\left[\nabla_\theta \log \pi_\theta(a|s) \cdot b(s)\right] &= 0
+\end{align*}
+
+Proof: for a single state-action pair,
+\begin{align*}
+  \mathbb{E}_{a \sim \pi_\theta(\cdot|s)}\!\left[\nabla_\theta \log \pi_\theta(a|s) \cdot b(s)\right]
+  &= b(s) \int \pi_\theta(a|s) \nabla_\theta \log \pi_\theta(a|s) \, da \\
+  &= b(s) \int \nabla_\theta \pi_\theta(a|s) \, da \\
+  &= b(s) \cdot \nabla_\theta \int \pi_\theta(a|s) \, da \\
+  &= b(s) \cdot \nabla_\theta 1 = 0
+\end{align*}
+
+The key step is exchanging the gradient and integral (valid under mild regularity) and using $\int \pi_\theta(a|s) da = 1$.
+
+\textbf{Variance-minimizing baseline.} The gradient estimator with baseline is $g(a) = \nabla_\theta \log \pi_\theta(a|s) \cdot (R - b(s))$. The variance is $\mathbb{E}[g^2] - (\mathbb{E}[g])^2$. Since $\mathbb{E}[g]$ is constant in $b$ (unbiasedness), minimizing variance means minimizing $\mathbb{E}[g^2]$. Let $h = \nabla_\theta \log \pi_\theta(a|s)$ and minimize over $b$:
+\begin{align*}
+  \frac{d}{db} \mathbb{E}\!\left[\|h\|^2 (R - b)^2\right] &= 0 \\
+  -2 \mathbb{E}\!\left[\|h\|^2 (R - b)\right] &= 0 \\
+  b^*(s) &= \frac{\mathbb{E}\!\left[\|\nabla_\theta \log \pi_\theta\|^2 \cdot R\right]}{\mathbb{E}\!\left[\|\nabla_\theta \log \pi_\theta\|^2\right]}
+\end{align*}
+
+This is the optimal baseline: the gradient-magnitude-weighted average return. \textit{Not} the value function $V(s) = \mathbb{E}[R | s]$. The value function is the unweighted average return --- it approximates $b^*$ only when $\|\nabla_\theta \log \pi_\theta\|^2$ is approximately constant across actions. This holds roughly when the policy is near-uniform. As training progresses and the policy sharpens, $\|\nabla_\theta \log \pi_\theta\|^2$ becomes highly non-uniform across actions (confident actions have near-zero gradient; uncertain actions have large gradient), and $V(s)$ becomes a worse approximation to $b^*$. GRPO uses group-normalized returns as a proxy --- question whether this is better or worse than $V(s)$ as an approximation to $b^*$.
+\end{thinkfirst}
+
+\begin{thinkfirst}{Natural Gradient and Distribution Geometry}
+The ordinary gradient $\nabla_\theta J$ is computed in parameter space. But parameter space is not the right geometry for policy optimization --- moving $0.01$ in one parameter direction might change the policy distribution by a large amount (e.g., shifting a weight that directly gates a high-probability token), while $0.01$ in another direction changes it negligibly (e.g., shifting a weight deep in a saturated layer). Optimizing in parameter space mixes these effects arbitrarily.
+
+\textbf{The Fisher information matrix.} Define:
+\begin{align*}
+  F(\theta) &= \mathbb{E}_{a \sim \pi_\theta(\cdot|s)}\!\left[\nabla_\theta \log \pi_\theta(a|s) \cdot \nabla_\theta \log \pi_\theta(a|s)^\top\right]
+\end{align*}
+
+$F$ measures the curvature of the policy distribution with respect to parameter changes. Large $F_{ii}$ means that changing $\theta_i$ by a small amount causes a large change in the distribution of $\pi_\theta$.
+
+\textbf{Connection to KL divergence.} For small perturbations $\delta$:
+\begin{align*}
+  D_{\mathrm{KL}}(\pi_\theta \| \pi_{\theta + \delta}) &\approx \frac{1}{2} \delta^\top F(\theta) \delta
+\end{align*}
+
+This follows from a Taylor expansion of the KL divergence. It means $F$ is the local metric tensor for the manifold of policy distributions --- the natural geometry is Riemannian with metric $F$, not Euclidean with metric $I$.
+
+\textbf{Natural gradient.} The steepest ascent direction under the constraint of a fixed KL change $\delta^\top F \delta = c$ is:
+\begin{align*}
+  \tilde{\nabla}_\theta J &= F(\theta)^{-1} \nabla_\theta J
+\end{align*}
+
+The natural gradient normalizes the ordinary gradient by the local distribution curvature. It is invariant to reparameterizations of $\theta$ --- if you change the parameterization of your policy network, the natural gradient update in distribution space is the same.
+
+\textbf{Why this matters for RLVR.} In high dimensions (billions of parameters), $F$ is never computed exactly. TRPO approximates the constraint $\delta^\top F \delta \leq \epsilon$ via conjugate gradient. PPO approximates the natural gradient via clipping. K-FAC and Shampoo approximate $F^{-1}$ via block-diagonal structure. Each of these is a different approximation to the same underlying geometry. Understanding this unifying picture lets you reason about which approximation breaks down first as model scale increases.
+\end{thinkfirst}
+
+\begin{thinkfirst}{PPO Clipping vs.\ Trust Regions}
+PPO and TRPO both aim to limit how much the policy changes per update. They do so differently, and the differences matter in the RLVR regime.
+
+\textbf{TRPO: hard KL constraint.} TRPO solves:
+\begin{align*}
+  \max_\theta \quad & \mathbb{E}\!\left[\frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)} \hat{A}(s,a)\right] \\
+  \text{s.t.} \quad & D_{\mathrm{KL}}(\pi_{\text{old}} \| \pi_\theta) \leq \delta
+\end{align*}
+
+The constraint is a hard bound on distribution change. TRPO uses conjugate gradient + line search, making it expensive per step but theoretically grounded: the trust region is in distribution space, matching the natural geometry.
+
+\textbf{PPO: clipping heuristic.} Let $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ be the importance ratio. PPO maximizes:
+\begin{align*}
+  L^{\text{CLIP}}(\theta) &= \mathbb{E}_t\!\left[\min\!\left(\rho_t \hat{A}_t,\; \text{clip}(\rho_t, 1-\epsilon, 1+\epsilon) \hat{A}_t\right)\right]
+\end{align*}
+
+When $\hat{A}_t > 0$ (good action), the objective is capped at $(1+\epsilon)\hat{A}_t$ --- the policy cannot increase the action probability by more than a factor of $(1+\epsilon)$. When $\hat{A}_t < 0$ (bad action), the objective is capped at $(1-\epsilon)\hat{A}_t$ --- the policy cannot decrease the action probability by more than a factor of $(1-\epsilon)$.
+
+\textbf{Non-equivalence.} TRPO's constraint is in distribution space (KL). PPO's clipping is in ratio space (per-action importance weights). These are not equivalent:
+
+\begin{itemize}
+  \item PPO can have small per-token ratios $\rho_t$ while accumulating a large joint KL over a long sequence --- the product $\prod_t \rho_t$ can differ dramatically from 1 even if each $\rho_t \in [1-\epsilon, 1+\epsilon]$.
+  \item When advantage estimates $\hat{A}_t$ are wrong in sign, PPO clips in the wrong direction: it allows the policy to move against the true advantage. TRPO's constraint is symmetric and does not make this error.
+  \item PPO's clipping does not account for the magnitude of the advantage. A large positive advantage with a large positive ratio is clipped the same way as a small positive advantage with a large positive ratio --- but the policy update risk is very different.
+\end{itemize}
+
+\textbf{RLVR regime: large batches and long sequences.} RLVR trains with long reasoning traces (hundreds to thousands of tokens) and large batch sizes (many rollouts per update). In this regime:
+\begin{itemize}
+  \item The joint KL divergence over a sequence accumulates across tokens: $D_{\mathrm{KL}}(\pi_{\text{old}}(\tau) \| \pi_\theta(\tau)) \approx \sum_t D_{\mathrm{KL}}(\pi_{\text{old}}(\cdot|s_t) \| \pi_\theta(\cdot|s_t))$. Even if each per-token KL is small, the sequence-level KL grows linearly in sequence length. PPO's per-token clipping does not control the sequence-level distribution change.
+  \item GRPO (Group Relative Policy Optimization) uses a group-normalized advantage and adds an explicit KL penalty to the reward --- a different approach that puts the KL constraint in the reward signal rather than the optimization constraint. Deriving when this is better or worse than PPO clipping is a research question, not a settled fact.
+\end{itemize}
+
+Write down your answer: at sequence length 2048 with $\epsilon = 0.2$, what is the worst-case sequence-level probability ratio $\prod_t \rho_t$ under PPO clipping? (Answer: $(1.2)^{2048} \approx 10^{157}$.) Does this concern you? What would a tighter per-sequence constraint look like?
+\end{thinkfirst}
+
+% -----------------------------------------------------------------------
+\subsection{Candidate Unlocks: Six Hypotheses}
+% -----------------------------------------------------------------------
+
+Research taste is not knowing the answer --- it is the ability to generate structured hypotheses and design experiments that distinguish between them. Rather than betting on one theory, the following six candidates are developed with equal rigor. The experiments in the next subsection test them. You should hold each hypothesis lightly: the right experiment could rule any of them out.
+
+\subsubsection{Candidate 1: RL-as-Inference / Variational View}
+
+\textbf{Hypothesis.} Policy gradient is variational inference. Define a target distribution over trajectories proportional to the exponentiated reward: $p^*(\tau) \propto \exp(R(\tau) / \alpha)$, where $\alpha > 0$ is a temperature. The policy optimization problem can be written as:
+\begin{align*}
+  \min_{\pi_\theta} \; D_{\mathrm{KL}}(\pi_\theta(\tau) \| p^*(\tau)) &= \min_{\pi_\theta} \; \mathbb{E}_{\pi_\theta}\!\left[\log \pi_\theta(\tau) - \frac{R(\tau)}{\alpha}\right] + \text{const}
+\end{align*}
+This is equivalent to maximizing $\mathbb{E}[R(\tau)/\alpha] - D_{\mathrm{KL}}(\pi_\theta \| p_{\text{ref}})$ for some reference policy. The KL penalty in GRPO (and RLHF) is the variational prior --- it regularizes $\pi_\theta$ toward the reference. The unlock: if you know the ELBO bound you are targeting, you can schedule $\alpha$ adaptively to improve convergence.
+
+\textbf{Prediction.} Adaptive KL scheduling (dynamically adjusting $\alpha$ to target a specific ELBO gap) should improve GRPO convergence speed and final reward compared to a fixed KL coefficient, because fixed $\alpha$ is wasteful: early in training when the policy is far from optimal, a large KL penalty slows exploration; late in training when the policy is near-optimal, the same penalty unnecessarily constrains fine-grained optimization.
+
+\textbf{Experiment.} Implement GRPO on TinyRL-Align (Chapter~7). Train three conditions: (a) fixed $\alpha = 0.01$, (b) fixed $\alpha = 0.1$, (c) adaptive $\alpha$ that adjusts to keep $D_{\mathrm{KL}}(\pi_\theta \| \pi_{\text{ref}}) \in [0.01, 0.05]$ at each step. Measure convergence speed (steps to 80\% of final reward) and final reward at 10K steps.
+
+\subsubsection{Candidate 2: Natural Gradient / Distribution Geometry}
+
+\textbf{Hypothesis.} PPO's clipping is a poor approximation to the natural gradient update, and the approximation degrades as model size increases. In high dimensions, the Fisher information matrix has highly non-uniform eigenvalues: most of the curvature is concentrated in a low-dimensional subspace corresponding to the most policy-sensitive parameter directions. PPO clips uniformly in ratio space, ignoring this structure.
+
+\textbf{Prediction.} The cosine similarity between PPO's gradient direction and the true natural policy gradient should decrease as model size increases, because larger models have more extreme Fisher eigenvalue distributions (longer tails in the spectrum).
+
+\textbf{Experiment.} Implement a small MLP policy (hidden dims 32, 64, 128, 256) on CartPole. At a fixed policy checkpoint, compute: (a) the ordinary policy gradient $g = \nabla_\theta J$, (b) the empirical Fisher $\hat{F} = \frac{1}{N} \sum_i h_i h_i^\top$ where $h_i = \nabla_\theta \log \pi_\theta(a_i|s_i)$, (c) the natural gradient $\tilde{g} = \hat{F}^{-1} g$ via conjugate gradient. Also compute the PPO gradient by running one PPO step from the same checkpoint. Measure $\cos(\tilde{g}, g_{\mathrm{PPO}})$ for each hidden dim. Plot cosine similarity vs.\ model size.
+
+\subsubsection{Candidate 3: GRPO Advantage Estimation Bias}
+
+\textbf{Hypothesis.} GRPO normalizes advantages within each group of $G$ rollouts from the same prompt: $\hat{A}_i = (R_i - \mu_{\text{group}}) / \sigma_{\text{group}}$. When reward variance differs systematically across prompts, this introduces a bias: low-variance prompts (where all rollouts get similar rewards) produce near-zero normalized advantages, so the policy barely updates on them. High-variance prompts produce large normalized advantages, so the policy updates heavily on them. If high-variance prompts are harder or less representative, GRPO over-specializes to them.
+
+\textbf{Prediction.} After GRPO training, per-prompt policy change (measured by KL divergence from initialization) should be higher for high-variance prompts than low-variance prompts, even if both prompt types have the same expected reward.
+
+\textbf{Experiment.} Create a prompt set with 50 prompts: 25 where the reward is $\mathrm{Bernoulli}(0.5) \in \{0, 1\}$ (high variance, $\sigma^2 = 0.25$), and 25 where the reward is $\mathcal{N}(0.5, 0.01)$ (low variance). Train with GRPO ($G = 8$) for 200 steps. After training, compute $D_{\mathrm{KL}}(\pi_{\text{final}}(\cdot|s) \| \pi_{\text{init}}(\cdot|s))$ for each prompt. Compare the mean KL across prompt types. Also compare to standard PPO trained on the same data.
+
+\subsubsection{Candidate 4: Entropy as Information Bottleneck}
+
+\textbf{Hypothesis.} Entropy collapse (the policy converging to near-deterministic behavior) is not merely a symptom of overfitting to the reward --- it reflects a sudden reduction in the effective dimensionality of the policy's logit representations. When entropy collapses, the effective rank of the output logit matrix (the matrix whose columns are logit vectors across tokens) drops sharply, indicating that the model has collapsed to a low-dimensional subspace of its representational capacity.
+
+\textbf{Prediction.} The effective rank of the logit matrix (measured by $\exp(H(\sigma))$ where $H(\sigma)$ is the entropy of the normalized singular value spectrum) should drop at the same training step as entropy collapse, not before or after.
+
+\textbf{Experiment.} Train a language model on TinyRL-Align with GRPO. At each checkpoint, compute: (a) mean policy entropy $H(\pi_\theta)$ over the validation set, (b) effective rank of the logit matrix (batch of 256 tokens, logits $\in \mathbb{R}^{256 \times V}$ where $V$ is vocabulary size, compute SVD and effective rank). Plot both metrics on the same axis over training. Compute Pearson correlation and the lag (in steps) between entropy drop and rank drop. If they are simultaneous, this supports the hypothesis.
+
+\subsubsection{Candidate 5: Credit Assignment in Sequence-Level Rewards}
+
+\textbf{Hypothesis.} Policy gradient with sequence-level rewards (one reward per full trajectory) applies the same reward signal to every token in the sequence, regardless of which token was causally responsible for the outcome. This means the policy gradient overcredits early tokens: they receive credit signals from more future trajectories (since early token choices determine the distribution of later states) and experience more gradient updates on average.
+
+\textbf{Prediction.} Learning speed should be higher (faster convergence in fewer steps) when the critical decision --- the token choice that determines the reward --- is at the beginning of the sequence rather than the end.
+
+\textbf{Experiment.} Construct a synthetic task: a sequence of $N$ binary choices, but the reward is determined entirely by choice at position $k$ (for $k \in \{1, N/4, N/2, 3N/4, N\}$). All other choices have no effect on reward. Train with REINFORCE (sequence-level reward) for each $k$. Measure convergence speed (steps to 90\% optimal policy at position $k$). Plot convergence speed vs.\ position $k$. Does it decrease monotonically? Does adding per-token advantage estimation (GAE) reduce the positional dependence?
+
+\subsubsection{Candidate 6: RLVR Long-Horizon Dynamics}
+
+\textbf{Hypothesis.} Over weeks-long RLVR training runs, the policy traverses qualitatively distinct regimes: (1) an exploration phase where entropy is high and gradient norms are large but reward is low, (2) an exploitation phase where the policy hones in on verifiable-reward strategies and reward climbs sharply, and (3) a verifier overfitting phase where the policy discovers reward-hacking strategies specific to the verifier and reward plateaus or drops on held-out distribution.
+
+\textbf{Prediction.} Phase transitions should be identifiable as discontinuities (sharp changes in slope) in training metrics --- specifically entropy, gradient norm, reward variance, and held-out reward --- at specific compute thresholds. The transitions should correspond to capability jumps measurable on independent benchmarks.
+
+\textbf{Experiment.} Train TinyRL-Code (Chapter~7) for 10$\times$ the standard number of steps. Log at every step: policy entropy, gradient $\ell_2$ norm, mean reward (training prompts), reward variance across rollouts, and held-out benchmark accuracy. Apply a change-point detection algorithm (e.g., PELT or binary segmentation) to each metric series. Do the detected change-points cluster at similar training steps across metrics? Do they correspond to jumps in held-out accuracy? If yes: what does this imply about when to stop training and how to schedule the KL coefficient?
+
+% -----------------------------------------------------------------------
+\subsection{Exercises}
+% -----------------------------------------------------------------------
+
+\begin{exercise}{Gradient Estimator Comparison (3--4 hours)}
+Implement four policy gradient estimators on CartPole-v1 and empirically characterize their gradient variance. The goal is to connect the theoretical variance analysis from the Foundation section to measured reality.
+
+\textbf{Environment setup.} Use \texttt{gymnasium} CartPole-v1. Policy: 2-layer MLP with hidden dim 64, softmax output. Initialize with a fixed random seed.
+
+\textbf{Estimator 1: REINFORCE.} Roll out 1000 episodes from the current policy. For each episode, compute the return $G_t = \sum_{t'=t}^{T} \gamma^{t'} r_{t'}$ with $\gamma = 0.99$. Gradient estimate: $\hat{g} = \frac{1}{N}\sum_{i,t} \nabla_\theta \log \pi_\theta(a_{i,t}|s_{i,t}) \cdot G_{i,t}$.
+
+\textbf{Estimator 2: REINFORCE with value baseline.} Train a separate value network $V_\phi(s)$ (same architecture, scalar output) with MSE loss on returns. Subtract: $\hat{A}_{i,t} = G_{i,t} - V_\phi(s_{i,t})$. Recompute gradient estimate using $\hat{A}_{i,t}$.
+
+\textbf{Estimator 3: PPO.} Collect 1000 episodes. Compute advantages with GAE ($\lambda = 0.95$). Run 4 epochs of PPO updates with $\epsilon = 0.2$. For the gradient estimate: record the gradient at the first PPO gradient step (before any update).
+
+\textbf{Estimator 4: Natural Policy Gradient.} Compute the empirical Fisher $\hat{F} = \frac{1}{N}\sum_i \nabla_\theta \log \pi_\theta(a_i|s_i) \nabla_\theta \log \pi_\theta(a_i|s_i)^\top$ using 500 samples. Compute $\tilde{g} = \hat{F}^{-1} g$ via conjugate gradient (10 iterations). This is exact (up to CG approximation) for the small CartPole policy.
+
+\textbf{Measurements.} For each estimator, collect 20 independent gradient estimates (each from a fresh 1000-episode rollout). Compute: (a) mean gradient norm $\mathbb{E}[\|\hat{g}\|]$, (b) variance of gradient norm $\mathrm{Var}[\|\hat{g}\|]$, (c) mean cosine similarity between each estimate and the mean estimate (measures direction variance). Plot the distribution of gradient norms as a box plot. Which estimator has lowest variance? Does the ranking match the theoretical prediction from Think First 1?
+\end{exercise}
+
+\begin{exercise}{Exact Natural Gradient vs.\ PPO (2--3 hours)}
+Test Candidate~2 directly: measure how closely PPO's gradient direction approximates the true natural gradient, and whether the approximation degrades with model size.
+
+\textbf{Setup.} Train a CartPole policy with hidden dims $d \in \{32, 64, 128, 256\}$ for 100 steps using vanilla policy gradient (enough to get a non-trivial policy but not converge). Freeze the policy weights at this checkpoint for all comparisons below.
+
+\textbf{Natural gradient computation.} Using 2000 rollouts from the frozen policy: compute the policy gradient $g = \nabla_\theta J$. Compute the empirical Fisher $\hat{F}$. Invert via conjugate gradient: $\tilde{g} = \hat{F}^{-1} g$ (use scipy's CG or implement from scratch). Normalize: $\tilde{g}_{\text{norm}} = \tilde{g} / \|\tilde{g}\|$.
+
+\textbf{PPO gradient computation.} From the same frozen policy, collect 2000 rollouts. Compute GAE advantages. Run \textit{one} PPO gradient step (no parameter update --- just compute the gradient of the clipped objective and collect it). Normalize: $g_{\text{PPO,norm}} = g_{\text{PPO}} / \|g_{\text{PPO}}\|$.
+
+\textbf{Measurement.} Compute $\cos(\tilde{g}_{\text{norm}}, g_{\text{PPO,norm}}) = \tilde{g}_{\text{norm}} \cdot g_{\text{PPO,norm}}$. Repeat for each hidden dim $d$. Plot cosine similarity vs.\ $d$. Also plot the ratio of the natural gradient norm to the ordinary gradient norm vs.\ $d$ --- this measures how much the curvature correction changes the update magnitude. Does cosine similarity decrease with $d$? If so, this is evidence for Candidate~2.
+\end{exercise}
+
+\begin{exercise}{GRPO Bias Test (2--3 hours)}
+Test Candidate~3: does GRPO's group normalization create systematic bias toward high-variance prompts?
+
+\textbf{Setup.} Use a small causal language model (GPT-2 small or equivalent, $\sim 117$M parameters). Construct a synthetic dataset with 50 prompts in two groups:
+
+\begin{itemize}
+  \item \textit{High-variance prompts} (25 prompts): the reward is determined by whether the model generates a specific rare token in the response. Each rollout independently has probability 0.5 of containing the target token ($\sigma^2_R = 0.25$).
+  \item \textit{Low-variance prompts} (25 prompts): the reward is always $0.5 \pm 0.01$ (nearly constant, e.g., a reward model that gives near-constant scores for this prompt type). $\sigma^2_R \approx 10^{-4}$.
+\end{itemize}
+
+Both groups have the same expected reward ($\approx 0.5$).
+
+\textbf{GRPO training.} Train with GRPO, $G = 8$ rollouts per prompt per step, for 200 gradient steps. Use a KL coefficient of $\beta = 0.01$.
+
+\textbf{Measurements.} After 200 steps, for each of the 50 prompts, compute $D_{\mathrm{KL}}(\pi_{\text{final}}(\cdot|s) \| \pi_{\text{init}}(\cdot|s))$ by sampling 100 completions and estimating empirically. Report: mean KL for high-variance prompts, mean KL for low-variance prompts, ratio. Also compare total reward improvement (final minus initial reward) across both groups. Does GRPO update more on high-variance prompts? Is the KL ratio consistent with the variance ratio? For comparison, run the same experiment with standard PPO (which uses a shared value baseline rather than group normalization).
+\end{exercise}
+
+\begin{exercise}{Open-Ended: The Unlock (2 hours, pen and paper)}
+Pick the candidate hypothesis you find most compelling after reading all six. Work from first principles.
+
+\textbf{Part 1: Additional predictions.} Derive 3 additional falsifiable predictions beyond the one listed for your chosen candidate. Each prediction should: (a) follow logically from the hypothesis via a mathematical or mechanistic argument, (b) be testable with an experiment you could run in 2--4 hours, (c) be capable of falsifying the hypothesis (not just confirming it). For each prediction, describe the minimal experiment --- the smallest implementation that would produce a decisive result.
+
+\textbf{Part 2: Adversarial case.} Design the experiment most likely to \textit{rule out} your chosen hypothesis. What data would you expect to see if the hypothesis is wrong? What would you conclude if you saw that data?
+
+\textbf{Part 3: A seventh candidate.} The six candidates above are not exhaustive. Generate a seventh candidate unlock that is not on the list. It should: (a) be grounded in a specific mathematical property of policy gradient that is not captured by any of the six candidates, (b) have at least one falsifiable prediction, (c) be something you genuinely believe could be important. Write 1--2 paragraphs explaining the hypothesis and one paragraph explaining why you find it interesting.
+
+\textbf{Hint for Part 3}: Consider properties of the trajectory distribution itself --- e.g., the geometry of the reward surface in token space, the relationship between the policy gradient and second-order optimization methods like Adam, or the interaction between the language model's pretraining distribution and the RL update direction.
+\end{exercise}
+
+% -----------------------------------------------------------------------
+\subsection{Research Taste}
+% -----------------------------------------------------------------------
+
+\begin{taste}
+If an interviewer asks ``What do you think policy gradient is really doing?'', the wrong answer is committing to one theory. Picking one framework and defending it signals that you stopped looking. The right answer demonstrates that you have been attacking the problem directly: ``I have been exploring this systematically. Here are six hypotheses I have been developing, here are the predictions I derived from each one, and here is what the experiments showed. The one I find most compelling right now is Candidate~X --- and here is why. But I hold it lightly. Here is the experiment that would change my mind.''
+
+This is research taste: not getting attached to a given solution, but attacking the problem directly. Attachment to a framework is comfortable --- it gives you a ready answer. But it stops you from updating when the evidence points elsewhere, and in research, the most important experiments are the ones that rule out your favorite hypothesis.
+
+The six candidates in this chapter are a starting point, not a complete list. The most important output of this chapter is not your answer to which candidate is right --- it is the skill of generating the next candidate when the current six are ruled out.
+\end{taste}
+
+\newpage

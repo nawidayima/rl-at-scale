@@ -1,0 +1,205 @@
+\section{Synthesis: How It All Connects}
+
+\subsection{The 9-Chapter Puzzle}
+
+Each chapter is a lens on the same question: how do we produce more capable intelligence per unit of energy? The chapters connect through the intelligence-per-Watt metric as follows.
+
+\textbf{Tier~1 optimizes FLOPs/Watt.} Chapter~1 (AMD MI300X) establishes a hardware baseline and reveals whether bandwidth or compute is the binding constraint for RLVR. Chapters~2--3 (NVIDIA/Blackwell, TPU/Pallas) build the kernel engineering depth needed to close the gap between theoretical and realized FLOP/s. Chapter~4 (RL Inference) attacks the generation bottleneck --- the actor's forward pass during rollout collection dominates RLVR wall time. Chapter~5 (Distributed Training) addresses the communication overhead that prevents linear scaling across nodes.
+
+\textbf{Tier~2 optimizes Quality/FLOP.} Chapter~6 (Policy Gradient) builds the theoretical foundation: which algorithmic choices --- clipping, GAE, KL penalties, entropy regularization --- are actually load-bearing, and why? Chapter~7 (TinyRL) operationalizes that theory in a community-auditable framework where every design decision has a clean ablation.
+
+\textbf{Tier~3 provides the systems foundation.} Chapter~8 (RL Pipeline \& Verification) addresses the silent failure modes that waste compute silently: reward hacking, gradient explosion, and reward model collapse. Chapter~9 (Scaling Laws) asks whether a training run is worth running before committing the compute.
+
+The chapters do not compose sequentially --- they compose \textit{hierarchically}. The hardware chapters set the iteration speed (experiments per week). The algorithm chapters determine what each experiment is testing. The systems chapters determine whether the experiment's result is trustworthy. All three must be healthy for a research program to move fast.
+
+\subsection{The PE--RL Flywheel}
+
+Performance Engineering and RLVR are not separate concerns. They form a flywheel:
+
+\begin{itemize}
+  \item \textbf{PE makes RLVR faster.} Higher generation throughput (Chapter~4) means more rollouts per hour. More rollouts per hour means more gradient steps per week. More gradient steps per week means faster policy improvement --- or faster discovery that a hypothesis is wrong.
+  \item \textbf{RLVR can automate PE decisions.} A policy trained with verifiable rewards on compiler benchmarks can learn quantization schemes, kernel configurations, and memory layout decisions that outperform human heuristics. Chapter~7's TinyRL framework is the natural substrate for these experiments.
+  \item \textbf{The person who understands both is uniquely valuable.} Most PE engineers do not understand what makes a policy gradient step meaningful. Most RL researchers do not know what a memory-bandwidth-bound kernel looks like in a profiler. The combination is rare and directly relevant to frontier RL infrastructure roles.
+\end{itemize}
+
+\subsection{Picking Your Portfolio Project}
+
+\begin{table}[h]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+\textbf{Criterion} & \textbf{AMD} & \textbf{CUDA} & \textbf{Pallas} & \textbf{Infer.} & \textbf{Distrib.} & \textbf{PG} & \textbf{TinyRL} \\
+ & \textbf{(Ch1)} & \textbf{(Ch2)} & \textbf{(Ch3)} & \textbf{(Ch4)} & \textbf{(Ch5)} & \textbf{(Ch6)} & \textbf{(Ch7)} \\
+\midrule
+Clean feedback?   & Yes  & Yes  & Yes    & Yes  & Yes    & Yes     & Yes  \\
+Fast iteration?   & Yes  & Yes  & Med.   & Yes  & Med.   & Yes     & Yes  \\
+Underexplored?    & V.Hi & Low  & High   & High & Med.   & ?       & High \\
+RLVR-relevant?    & Yes  & Yes  & Yes    & Very & Yes    & Yes     & Very \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Recommendation by goal:}
+\begin{itemize}
+  \item \textbf{Fastest artifact (5--7 weeks):} Ch1 AMD benchmark. One number --- MI300X vs.\ H100 on end-to-end RLVR throughput --- is all you need to start a conversation.
+  \item \textbf{Strongest community signal:} Ch7 TinyRL. Open-source + leaderboard entries are persistent artifacts that compound over time.
+  \item \textbf{Broadest role targeting:} Ch2 + Ch3. Covers GPU Kernel Engineering (NVIDIA stack) and TPU Kernel Engineering simultaneously.
+  \item \textbf{Highest research ceiling:} Ch6 Policy Gradient hypotheses. A single confirmed or refuted hypothesis about clipping behavior or GAE bias is more valuable than a benchmark table, if it changes how people train policies.
+\end{itemize}
+
+\subsection{The Meta-Lesson}
+
+Every project in this workbook follows the same template:
+
+\begin{enumerate}
+  \item Pick a well-defined problem with clean verification.
+  \item Build the simplest version that could possibly produce a signal.
+  \item Ablate one variable at a time. Predict before you observe.
+  \item Document honestly --- negative results and failed hypotheses are publishable.
+  \item Publish. An artifact that exists is worth more than a project that is almost done.
+\end{enumerate}
+
+Before calling a project ``done,'' answer three questions: (1) Can you point to a single number that says you succeeded? (2) Can you run one full experiment cycle --- change, train, evaluate --- in under one day? (3) Does the artifact have value to someone besides you? If all three are yes, you are done. If any is no, the project is not finished --- it is a draft.
+
+\vfill
+\begin{center}
+\small\textit{Compiled \today.}
+\end{center}
+
+\newpage
+\section*{Appendix A: World Models \& the JEPA Debate}
+
+\textit{This material is moved from the main track to an appendix per guidance to allocate a ``small exploration budget'' to alternative approaches. The content is valuable for breadth but not on the critical path for PE/RE roles. Read it after completing the core chapters. The exercises here are genuinely interesting and could yield a portfolio project --- but only after you have a working nanoRLVR and a scaling law replication in hand.}
+
+LeCun claims autoregressive LLMs are a dead end for machine intelligence. Meta's AMI Labs raised \$1B on that thesis. Dreamer models collect diamonds in Minecraft without human data. Meanwhile, DeepSeek R1 shows RLVR on LLMs produces emergent reasoning from nothing but a right/wrong signal. Who's right? This appendix gives you the math to decide for yourself --- and proposes experiments at the intersection that could matter for frontier RL teams.
+
+\begin{whythis}
+The RLVR scaling team is compute-constrained. If model-based RL (Dreamer-style) could improve sample efficiency by 10$\times$ on code tasks, that's equivalent to a 10$\times$ compute budget increase. If it can't, pursuing it is a distraction. This appendix builds the judgment to evaluate that tradeoff --- a skill that matters whether the answer is yes or no.
+\end{whythis}
+
+\subsection*{The Three Prediction Paradigms}
+
+Before comparing architectures, understand what each one \textit{predicts} and what that costs information-theoretically.
+
+\textbf{Paradigm 1: Autoregressive (LLMs).} Predict the next token in observation space:
+$$\mathcal{L}_{\text{LLM}} = -\mathbb{E}\left[\log p(t_{k+1} \mid t_{1:k})\right]$$
+Cross-entropy over a discrete vocabulary ($|V| \approx$ 50--100K). Must model \textit{all} stochasticity in the token distribution --- rare words, formatting, irrelevant details.
+
+\textbf{Paradigm 2: Pixel prediction (MAE, video models).} Predict masked pixels:
+$$\mathcal{L}_{\text{pixel}} = \|x_{\text{masked}} - \hat{x}_{\text{masked}}\|_2^2$$
+L2 in pixel space. Must model textures, lighting, noise --- everything. Entropy cost: $H(X) \gg H(\text{semantics})$.
+
+\textbf{Paradigm 3: JEPA (representation prediction).} Predict masked \textit{embeddings}:
+$$\mathcal{L}_{\text{JEPA}} = \frac{1}{M}\sum_{i=1}^{M}\|\hat{y}_i - y_i\|_2^2$$
+where $\hat{y}_i = g_\phi(s_x, z_i)$ is the predictor's output, $y_i = \text{Enc}_{\text{target}}(\text{patch}_i)$ is the target encoder's embedding (with stop-gradient), and the target encoder is updated via EMA: $\theta_{\text{target}} \leftarrow \tau \cdot \theta_{\text{target}} + (1 - \tau)\cdot\theta_{\text{context}}$, $\tau \approx 0.999$.
+
+\textbf{The key difference:} JEPA's prediction target is a \textit{learned} representation ($\sim$768D), not raw observations ($\sim$50K tokens or millions of pixels). The model learns what to throw away. Without care, it collapses to a constant --- VICReg prevents this with explicit variance and covariance regularization terms, no negative samples needed.
+
+\textbf{Model-based RL (Dreamer):} Learn a world model, then optimize the policy \textit{in imagination}. DreamerV3's RSSM learns deterministic hidden state $h_t = f(h_{t-1}, z_{t-1}, a_{t-1})$ and stochastic latent $z_t$ (32 categorical distributions via straight-through gradients). Policy is optimized on imagined $H$-step rollouts using $\lambda$-returns --- no gradients flow back into the world model. Empirically: $\sim$10$\times$ fewer real environment interactions than model-free RL on control tasks. DreamerV3 was the first algorithm to collect diamonds in Minecraft from scratch on a single V100.
+
+\subsection*{Conceptual Foundation}
+
+\begin{thinkfirst}{Prediction in observation space vs.\ representation space}
+\begin{enumerate}
+  \item An LLM trained on code must predict the next token in a Python file. When it encounters \texttt{x = 3 + 4}, it must assign probability to the token \texttt{7}, but also to formatting tokens, variable names, and comments. How much of the model's capacity is ``wasted'' on tokens that don't affect program behavior? Now imagine a JEPA-style model that predicts program \textit{state} embeddings instead of tokens. What would it throw away? What might it lose?
+
+  \item JEPA predicts in $\sim$768D continuous embedding space. LLMs predict over $\sim$50K discrete tokens. Which is cheaper in bits? Which carries more information about the world?
+
+  \item LeCun argues that predicting tokens ``wastes capacity on irrelevant details.'' But LLMs trained on code develop genuine reasoning capabilities (DeepSeek R1: 15.6\% $\to$ 77.9\% AIME from RLVR alone). How do you reconcile these facts? Is it possible that ``wasting capacity'' on surface details is actually a form of grounding that helps reasoning? Argue both sides.
+
+  \item V-JEPA achieves 81.9\% on Kinetics-400 with $<$1200 GPU hours of pretraining (2.5$\times$ faster than iBOT, 10$\times$ faster than MAE). But it has never been demonstrated on abstract reasoning tasks. Is this a limitation of the architecture or just a matter of applying it to the right domain?
+\end{enumerate}
+\end{thinkfirst}
+
+\begin{thinkfirst}{Model-based vs.\ model-free: when does the world model pay for itself?}
+\begin{enumerate}
+  \item DreamerV3 achieves $\sim$10$\times$ sample efficiency over model-free RL on control tasks. But it requires 2--5$\times$ more \textit{compute} per environment step. Under what conditions is the 10$\times$ sample savings worth the 2--5$\times$ compute overhead? (Hint: when are environment interactions expensive vs.\ cheap?)
+
+  \item For LLM RLVR, the ``environment interaction'' is generating a completion and running the verifier. If inference costs \$X per rollout, a world model that reduces rollouts by 10$\times$ but costs $5X$ to train saves money when $N > \text{???}$. Work out the crossover. Are frontier labs likely above or below it?
+
+  \item In code execution, the ``environment'' is the compiler/interpreter --- nearly free to run. If running unit tests costs effectively zero, does a learned world model for code execution have \textit{any} sample efficiency advantage? Where is the real bottleneck?
+
+  \item MuZero combined world models with RL for board games with perfect state information and deterministic dynamics. What breaks when you try this for code generation, where the ``state'' is a partially written program and ``dynamics'' are compiler output depending on unseen test inputs?
+\end{enumerate}
+\end{thinkfirst}
+
+\begin{thinkfirst}{Evaluating paradigm claims --- is LeCun right?}
+Here are the actual benchmark results:
+
+\begin{enumerate}
+  \item \textbf{JEPA results:} V-JEPA 2 achieves 88.2\% average across 6 video benchmarks. Zero-shot robot control from 1 hour of DROID data. Strong on perception and physics prediction.
+
+  \item \textbf{LLM+RLVR results:} DeepSeek R1 achieves 77.9\% AIME (math reasoning). OpenAI o1 achieves 93\% AIME with 1000-sample reranking. Emergent chain-of-thought and backtracking from only a right/wrong signal.
+
+  \item Do these results support ``LLM+RL is a dead end,'' ``JEPA is a dead end,'' or ``they solve different problems''? What would you need to see to change your answer?
+
+  \item LeCun founded AMI Labs with \$1B in March 2026 on the thesis that JEPA-based world models will outcompete LLMs for AGI. What \textit{specific benchmark result} would AMI Labs need to produce in the next 12 months to validate this thesis? What result would invalidate it? Being concrete is the exercise --- vague claims like ``better reasoning'' don't count.
+
+  \item \textbf{The meta-question:} When someone claims ``X approach is fundamentally limited,'' what's your checklist for evaluating that claim? Write down 4 criteria. (Suggested: (a) is there a mathematical proof or just an argument by analogy? (b) have empirical results already violated the claimed limitation?)
+\end{enumerate}
+\end{thinkfirst}
+
+\subsection*{Hands-On Exercises}
+
+\begin{exercise}{JEPA vs.\ autoregressive prediction on a toy sequence (3--4 hours)}
+Build both prediction paradigms on the same toy task. Generate synthetic time series from $x_{t+1} = A \cdot x_t + \epsilon_t$, where $x \in \mathbb{R}^{10}$, $A$ is a fixed rotation matrix, $\epsilon_t \sim \mathcal{N}(0, \sigma^2 I)$.
+
+\textbf{Approach 1 (Autoregressive):} Discretize each dimension into 64 bins. Train a small transformer to predict the next token. \textbf{Approach 2 (JEPA-style):} Train a context encoder + predictor to predict future embeddings. Use EMA for target encoder ($\tau = 0.99$). Add variance regularization to prevent collapse.
+
+Compare: (a) sample efficiency, (b) noise robustness as $\sigma$ increases, (c) whether the learned representations capture the rotation matrix $A$ better than surface statistics. \textbf{Critical question:} Increase noise until autoregressive prediction becomes useless. Does JEPA still work? If so, you've demonstrated LeCun's core claim in miniature. If not, what does that tell you?
+\end{exercise}
+
+\begin{exercise}{Build a minimal world model for code execution (6--8 hours)}
+Can you learn a world model for program execution? Generate a dataset of simple Python programs with execution traces: $(\text{code}, \text{input}) \to (\text{state}_0, \ldots, \text{state}_T, \text{output})$. Fine-tune GPT-2 (124M) to predict the next program state given the current state and next line: $\hat{s}_{t+1} = f_\theta(s_t, \text{line}_{t+1})$.
+
+Evaluate single-step prediction accuracy (easy) and multi-step rollout accuracy (hard --- errors compound). At what program length does the world model's rollout diverge from reality? \textbf{The fundamental question:} For code, the interpreter is deterministic and nearly free. A learned world model is approximate and expensive. Under what conditions would you \textit{ever} prefer it? (Hint: when the verifier is slow, expensive, or unavailable --- integration tests, real APIs, hardware, human judgment.)
+\end{exercise}
+
+\begin{exercise}{Sample efficiency showdown: model-based vs.\ model-free (4--6 hours)}
+Direct empirical comparison on gridworld mazes (reuse from Ch9). Agent 1: DQN or PPO (model-free). Agent 2: simplified Dreamer --- learn a dynamics model $\hat{s}_{t+1} = f_\theta(s_t, a_t)$ and reward model, then imagine $H = 10$ steps per real step.
+
+Measure: (a) real environment steps to reach 80\% solve rate, (b) total wall-clock compute to reach 80\% solve rate --- at what maze size does sample efficiency overcome compute overhead? (c) world model accuracy over training --- what happens to the policy when the world model is inaccurate? (d) Does the model-based advantage grow or shrink with maze size? What does this predict for code generation?
+\end{exercise}
+
+\begin{exercise}{Hybrid RL: world model as a cheap pre-filter (4--6 hours)}
+Test the most promising hybrid approach for frontier RL teams. Train a ``fast reward predictor'' --- a small model that predicts the verifier's score from partial completions (first 50\% of tokens). During rollout: generate $N = 32$ partial completions per prompt; use the fast predictor to score all 32; complete only the top $K = 8$; score with the full verifier.
+
+Compare to baseline (8 full completions scored by verifier directly). Measure: (a) does filtering find higher-reward completions? (b) is it cheaper in total compute? (c) how accurate does the predictor need to be for filtering to help? Find the accuracy threshold by deliberately degrading the predictor with less training data.
+\end{exercise}
+
+\begin{portfolio}{Code Execution World Models for RL Training}
+The hybrid experiment that could actually matter: can a learned world model for code execution improve the efficiency of RLVR training on coding tasks?
+
+\textbf{Architecture:} (1) World model: fine-tune a small LLM to predict test outcomes from code --- given (problem, candidate solution, test spec), predict (pass/fail, error type, partial output). Train on 10K+ solved problems with execution traces. (2) RLVR integration: use the world model as a ``cheap verifier'' in the GRPO loop --- generate $N$ candidates, score with world model, select top $K$ for real execution. (3) Calibration: measure the cost of false positives (predicts pass, actually fails) and false negatives (predicts fail, actually passes) to RL convergence.
+
+\textbf{The monkey:} Not ``can you build a world model for code'' (pedestal) but ``is the filtering it provides worth it given that real execution is cheap?'' Finding and documenting the crossover verification-cost threshold is the contribution.
+
+\textbf{Expected outcome:} For cheap verifiers (unit tests), the world model probably isn't worth it. For expensive verifiers (integration tests, API calls, human evaluation), it likely is. Find and document this crossover.
+
+\textbf{Deliverable:} Blog post with results and concrete recommendation for when RL teams should invest in world models. \textbf{Verification:} Your crossover analysis identifies a specific verification-cost threshold (in seconds or dollars per evaluation) above which world model filtering saves total compute.
+\end{portfolio}
+
+\subsection*{The Critical Analysis Framework}
+
+This section teaches a \textit{meta-skill}: how to evaluate paradigm claims in ML. The LLM+RLVR vs.\ world models debate is not the last such debate you will encounter.
+
+\textbf{When someone claims ``X approach is fundamentally limited,'' apply this checklist:}
+
+\begin{enumerate}
+  \item \textbf{Is there a mathematical proof of the limitation, or an argument by analogy?} LeCun's claim that autoregressive models ``can't plan'' is an argument by analogy. But DeepSeek R1 empirically \textit{does} plan via learned chain-of-thought. Arguments by analogy can be wrong when the system finds unexpected workarounds.
+
+  \item \textbf{Have empirical results already violated the claimed limitation?} If yes, the claim needs updating. o1 achieving 93\% on AIME via test-time search within an autoregressive model directly contradicts ``autoregressive models can't do hierarchical planning.''
+
+  \item \textbf{Are the benchmarks comparable?} JEPA achieves 88.2\% on video understanding. R1 achieves 77.9\% on math reasoning. These are \textit{different tasks}. Claiming one approach is ``better'' without specifying the task is meaningless.
+
+  \item \textbf{What are the incentives?} AMI Labs raised \$1B on the thesis that LLMs are a dead end. Anthropic's valuation depends on LLM+RLVR continuing to work. Neither party is a neutral evaluator. Look at the results, not the press releases.
+
+  \item \textbf{Is it a false dichotomy?} Most ``X vs.\ Y'' debates in ML resolve as ``X for some tasks, Y for others, and X+Y for a third set.'' MuZero combined world models with RL. The interesting question isn't which paradigm wins --- it's where the hybrid is better than either alone.
+\end{enumerate}
+
+\begin{taste}
+If an interviewer asks ``What do you think about world models vs.\ RL scaling?'' --- the wrong answer is picking a side. The right answer is: ``They solve different problems. World models excel at sample-efficient learning for physics and control. RLVR scaling excels at abstract reasoning with clean verification. The interesting frontier is where you combine them --- like using a learned world model to reduce inference costs during RLVR training. I'd want to run the experiment before committing.'' This demonstrates research taste: you don't pick sides, you identify the informative experiment.
+\end{taste}
+
