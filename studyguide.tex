@@ -1,0 +1,39 @@
+\documentclass[10pt, letterpaper, twocolumn]{article}
+
+\usepackage[margin=0.55in, top=0.45in, bottom=0.45in]{geometry}
+
+\input{preamble}
+
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+\titleformat{\section}{\large\bfseries\scshape}{}{0em}{}[\titlerule]
+\titlespacing*{\section}{0pt}{8pt}{4pt}
+\titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+\titlespacing*{\subsection}{0pt}{5pt}{2pt}
+\titleformat{\subsubsection}[runin]{\normalsize\bfseries\itshape}{}{0em}{}[.]
+\titlespacing*{\subsubsection}{0pt}{3pt}{4pt}
+\setlist[itemize]{nosep, leftmargin=1.2em, label=\textbullet, topsep=1pt}
+\setlist[enumerate]{nosep, leftmargin=1.5em, topsep=1pt}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE \textbf{Anthropic RE Interview: Strategic Study Guide}}\\[3pt]
+  {\small Print this. Study in the park. No internet needed.}\\[1pt]
+  {\small Structure: every section leads with the key idea, ends with ``how to say it''}
+\end{center}
+
+\medskip
+\noindent\textbf{How to use this guide:} Each section is organized top-down. Read the grey and green boxes first --- that's your conversational ammunition. Orange boxes are depth for if they push. Equations are in the appendix only. You're preparing for a \textit{technical conversation between two systems thinkers}, not a midterm.
+
+\noindent\textbf{Structure:} \textbf{Sections 1--6} (including 5.5) are your technical foundation (RL pipeline, reward hacking, scaling, Constitutional AI, the verification bottleneck pattern). \textbf{Sections 7--10} are interview tactics (hard questions, research proposals, depth questions, project strategy). \textbf{Sections 11--12} are deep dives if the conversation goes technical on scaling laws or hardware. \textbf{Sections 13--14} are quick reference. Read in order first, then revisit by need.
+
+\input{studyguide/01-research-taste}
+\input{studyguide/02-rl-foundations}
+\input{studyguide/03-scaling-and-alignment}
+\input{studyguide/04-interview-tactics}
+\input{studyguide/05-deep-dives}
+\input{studyguide/06-reference-appendix}
+
+\end{document}
