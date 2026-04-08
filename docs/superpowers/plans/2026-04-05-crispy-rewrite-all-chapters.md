@@ -1,3 +1,7 @@
+> **DEPRECATED:** This plan references the old 9-chapter structure. The textbook
+> has been restructured to 6 chapters per `docs/superpowers/specs/2026-04-07-textbook-restructure-design.md`.
+> A new crispy-rewrite plan should be created for the new chapter structure.
+
 # Crispy-Rewrite All Chapters Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
