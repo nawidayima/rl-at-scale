@@ -1,2 +1,98 @@
 \section*{Introduction}
-% TODO: Write new introduction per spec Section 3, Chapter 0
+
+Frontier AI labs are valued at hundreds of billions of dollars on the premise that they will achieve AGI. These valuations are sustained by related-party investment cycles --- GPU suppliers, cloud providers, and strategic partners funding each other. This is not a stable equilibrium. When capital markets tighten, the labs that survive are the ones whose unit economics justify their existence independently.
+
+Responsible AGI development requires fiscal sustainability. A lab that cannot cover the cost of its own inference workloads is a lab that depends on the next funding round to keep the lights on. This book is about making that cost as low as physics allows.
+
+\subsection*{Inference Is the Largest Variable Cost}
+
+The case for serving is obvious. Every API call, every conversation, every enterprise deployment runs inference. Revenue comes from inference. The cost of generating tokens at scale is the single largest variable expense a frontier lab faces. This is not controversial --- it is the default framing for anyone who has seen the bills.
+
+The less obvious case: \textbf{RL training loops are also inference workloads.} Reinforcement learning from verifiable rewards (RLVR) requires generating thousands of rollouts per policy update. Rollout generation --- autoregressive token sampling across large batches --- dominates RL training cost, consuming 50--70\% of wall-clock time. The boundary between ``inference'' and ``training'' collapses. The same kernels, the same memory-bandwidth bottlenecks, the same batching strategies that determine serving cost also determine training cost.
+
+This is where the hardest optimization problems live. And the skills transfer directly: every technique that makes rollout generation faster also makes production serving cheaper.
+
+\subsection*{This Book's Focus}
+
+\begin{tcolorbox}[colback=beni!5!white, colframe=beni!80!black, boxrule=0.6pt,
+  left=5pt, right=5pt, top=6pt, bottom=6pt,
+  fonttitle=\bfseries, title=North Star Metric]
+\textbf{Policy improvement per dollar of rollout compute.}
+
+\smallskip
+Every chapter in this book is evaluated against this metric. A kernel optimization matters if it increases rollout throughput per dollar. A policy gradient variant matters if it extracts more improvement from the same rollouts. Everything else is interesting but off-topic.
+\end{tcolorbox}
+
+\textbf{Convergence thesis.} Performance engineering and research engineering are not separate disciplines with separate textbooks. The person who understands GPU memory hierarchies \textit{and} policy gradient variance is the person who can identify whether a training run is slow because of a systems bottleneck or an algorithmic one. This book addresses a single reader responsible for both perspectives.
+
+\textbf{Experimental philosophy.} Test the riskiest assumption at the smallest informative scale. This is the TinyStories principle: design experimental setups where small scale preserves the phenomenon under study. A 1M-parameter model on a single GPU can exhibit the same memory-wall behavior as a 70B-parameter model on a cluster --- if the experiment is designed correctly. We do not prescribe compute budgets. We prescribe the discipline of knowing what your experiment is testing before you run it.
+
+% --- RL Inference/Training Flywheel ---
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=2.8cm,
+  every node/.style={font=\small},
+  box/.style={
+    draw=aiiro, thick, rounded corners=6pt, fill=aiiro!6,
+    minimum width=2.6cm, minimum height=1.2cm,
+    text centered, font=\small\bfseries, text width=2.4cm
+  },
+  arr/.style={
+    -{Stealth[length=6pt]}, thick, aiiro!80
+  }
+]
+  % Nodes in a cycle (clockwise from top-left)
+  \node[box] (fast) {Faster rollout generation};
+  \node[box, right=of fast] (more) {More rollouts per dollar};
+  \node[box, below=of more] (better) {Better gradient estimates};
+  \node[box, below=of fast] (smarter) {Smarter model};
+
+  % Inner cycle arrows
+  \draw[arr] (fast) -- (more);
+  \draw[arr] (more) -- (better);
+  \draw[arr] (better) -- (smarter);
+  \draw[arr] (smarter) -- (fast);
+
+  % External reinforcing loop (revenue cycle)
+  \draw[arr, dashed, aiiro!50]
+    (smarter.south) -- ++(0,-0.6)
+    -| ([xshift=-1.8cm]fast.west)
+    -- (fast.west);
+  \node[font=\footnotesize, text=sumi, text width=3.6cm, align=center]
+    at ([yshift=-1.4cm]$(smarter.south west)!0.5!(smarter.south)$)
+    {Worth more to serve $\rightarrow$\\revenue funds compute};
+
+  % North star annotation
+  \node[font=\footnotesize\itshape, text=beni, text width=3.2cm, align=center]
+    at ([yshift=0.8cm]$(fast)!0.5!(more)$)
+    {North star: policy improvement per dollar};
+
+\end{tikzpicture}
+\end{center}
+
+The flywheel above is the core feedback loop. Faster rollout generation yields more rollouts per fixed compute budget, which produces lower-variance policy gradient estimates, which produces a smarter model. A smarter model is worth more to serve --- inference revenue funds the next round of compute, which funds further optimization of rollout generation. Every chapter in this book accelerates one edge of this cycle.
+
+\subsection*{Chapter Map}
+
+Five content chapters form a linear pipeline. Each builds on the previous, and each teaches a distinct thinking pattern:
+
+\medskip
+\begin{center}
+\begin{tabular}{@{}rll@{}}
+\toprule
+\textbf{Ch} & \textbf{Title} & \textbf{Thinking Pattern} \\
+\midrule
+1 & The Memory Wall      & Reason about hardware \\
+2 & Kernel Optimization   & Optimize the building blocks \\
+3 & Rollout Generation    & Optimize the system \\
+4 & Policy Gradients      & Understand the consumer \\
+5 & The RL Pipeline       & Build the whole thing \\
+\bottomrule
+\end{tabular}
+\end{center}
+\medskip
+
+Chapter~1 establishes why inference is memory-bound, not compute-bound, on current hardware. Chapter~2 applies that understanding to individual kernels --- the building blocks. Chapter~3 composes kernels into a rollout generation system and optimizes end-to-end throughput. Chapter~4 steps back to understand the consumer of those rollouts: policy gradient algorithms, their variance properties, and what they actually need from the generation system. Chapter~5 wires everything together into a functioning RL training pipeline, closing the loop from hardware to learning signal.
+
+The pipeline is linear, but the understanding is circular. After Chapter~5, you will read Chapter~1 differently.
