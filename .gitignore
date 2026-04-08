@@ -6,3 +6,6 @@ build/
 *.out
 *.toc
 *.pdf
+*.fls
+*.fdb_latexmk
+_ch_tmp.tex
