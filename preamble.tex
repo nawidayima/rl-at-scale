@@ -10,73 +10,59 @@
 \usepackage{lmodern}
 \usepackage{booktabs}
 \usepackage{xcolor}
+% --- Nippon Seasons palette (日本の伝統色) ---
+\definecolor{kitsune}{HTML}{C3803A}   % 狐色 fox — autumn
+\definecolor{aiiro}{HTML}{004C71}     % 藍色 indigo — winter
+\definecolor{beni}{HTML}{B14A4A}      % 紅 safflower — summer
+\definecolor{matcha}{HTML}{7B8B4E}    % 抹茶 tea — spring
+\definecolor{sumi}{HTML}{4A4A4A}      % 墨 ink — timeless
+% Colorblind-safe code syntax (Okabe-Ito derived)
+\definecolor{codekey}{HTML}{0077BB}
+\definecolor{codecomm}{HTML}{7F7F7F}
+\definecolor{codestr}{HTML}{009988}
 \usepackage{tcolorbox}
+\tcbuselibrary{breakable}
 \usepackage{listings}
 \usepackage{fancyvrb}
-
-% --- Study Guide boxes ---
-
-% BLUF box - the one thing to walk away knowing
-\newtcolorbox{bluf}{
-  colback=black!5, colframe=black!70, boxrule=0.8pt,
-  left=4pt, right=4pt, top=3pt, bottom=3pt,
-  fonttitle=\bfseries\small, title=The Key Idea
-}
-
-% "How to say it" box
-\newtcolorbox{sayit}[1][]{
-  colback=green!4, colframe=green!50!black, boxrule=0.5pt,
-  left=4pt, right=4pt, top=2pt, bottom=2pt,
-  fonttitle=\bfseries\small, title=How to say it: #1
-}
-
-% "If they probe deeper" box
-\newtcolorbox{deeper}{
-  colback=orange!5, colframe=orange!60, boxrule=0.5pt,
-  left=4pt, right=4pt, top=2pt, bottom=2pt,
-  fonttitle=\bfseries\small, title=If they probe deeper
-}
-
-% "Why it matters for Anthropic" box
-\newtcolorbox{whyanthro}{
-  colback=blue!4, colframe=blue!40, boxrule=0.5pt,
-  left=4pt, right=4pt, top=2pt, bottom=2pt,
-  fonttitle=\bfseries\small, title=Why this matters for Anthropic
-}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, calc, patterns, fit, decorations.pathreplacing}
 
 % --- Workbook boxes ---
 
-% Exercise box
+% Exercise box (Kitsune — autumn warmth)
 \newtcolorbox{exercise}[1][]{
-  colback=yellow!5, colframe=yellow!60!black, boxrule=0.6pt,
+  colback=kitsune!5!white, colframe=kitsune!80!black, boxrule=0.6pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
-  fonttitle=\bfseries\small, title=Exercise: #1
+  fonttitle=\bfseries\small, title=Exercise: #1,
+  breakable
 }
 
-% Think-first box (conceptual, no computer needed)
+% Think-first box (Ai-iro — winter depth)
 \newtcolorbox{thinkfirst}[1][]{
-  colback=purple!5, colframe=purple!50, boxrule=0.5pt,
+  colback=aiiro!5!white, colframe=aiiro!70!black, boxrule=0.5pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
-  fonttitle=\bfseries\small, title={Think First (no computer): #1}
+  fonttitle=\bfseries\small, title={Think First (no computer): #1},
+  breakable
 }
 
-% Portfolio project box
+% Portfolio project box (Beni — summer culmination)
 \newtcolorbox{portfolio}[1][]{
-  colback=green!5, colframe=green!50!black, boxrule=0.6pt,
+  colback=beni!5!white, colframe=beni!80!black, boxrule=0.6pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
-  fonttitle=\bfseries\small, title={Portfolio Project: #1}
+  fonttitle=\bfseries\small, title={Portfolio Project: #1},
+  breakable
 }
 
-% Why this matters box
+% Why this matters box (Matcha — spring relevance)
 \newtcolorbox{whythis}{
-  colback=blue!4, colframe=blue!40, boxrule=0.5pt,
+  colback=matcha!5!white, colframe=matcha!70!black, boxrule=0.5pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
   fonttitle=\bfseries\small, title=Why This Matters at Frontier Scale
 }
 
-% Research taste box
+% Research taste box (Sumi — timeless ink)
 \newtcolorbox{taste}{
-  colback=gray!6, colframe=gray!60, boxrule=0.5pt,
+  colback=sumi!5!white, colframe=sumi!70!black, boxrule=0.5pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
   fonttitle=\bfseries\small, title=Research Taste Check
 }
