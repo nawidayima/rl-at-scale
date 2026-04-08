@@ -1,0 +1,336 @@
+\section{Benchmarking AMD MI300X for RLVR Training Workloads}
+
+\smallskip
+
+\begin{whythis}
+RLVR training runs last \textit{weeks}. Most of that wall time is autoregressive generation --- producing rollouts one token at a time. Generation is memory-bandwidth-bound: every decode step loads the full weight matrix and KV~cache from HBM. No algorithm change fixes this. The roofline ceiling is bandwidth.
+
+AMD's MI300X offers 5.3~TB/s of HBM3 bandwidth (vs.\ H100's 3.35~TB/s) and 192~GB of on-chip memory (vs.\ 80~GB). If the software stack delivers, that 1.58$\times$ bandwidth advantage translates almost directly to 1.58$\times$ generation throughput --- shaving days off a multi-week training run.
+
+The engineering question: is AMD's software ecosystem mature enough for the hardware advantage to survive contact with real workloads? This chapter builds the evidence base. You will benchmark 5 RLVR-critical operations on MI300X, identify where AMD wins and where software gaps erase the hardware advantage, and produce a gap analysis that a senior RL engineer could act on.
+\end{whythis}
+
+\subsection{Prerequisites and Hardware}
+
+\textbf{Prior chapters:} Chapter~1 (CUDA Kernel Optimization) is the recommended prerequisite --- it builds the GPU mental model (roofline analysis, memory hierarchy, profiling workflow) that this chapter applies to AMD hardware. If you have completed Chapter~1, an optional deep-dive appendix at the end lets you port kernel intuitions to AMD.
+
+\textbf{Fast track (skip Chapter~1):} If you want to jump straight to AMD, you need three things: (1) the roofline model --- what arithmetic intensity is, how to compute it, what ``memory-bound'' vs.\ ``compute-bound'' means (this chapter's Think First boxes teach this self-contained); (2) how to time GPU operations with synchronization barriers (\texttt{torch.cuda.synchronize()}, covered in Part~A); (3) a conceptual model of GPU memory hierarchy --- registers are fastest, then on-chip shared memory (tens of KB), then L2 cache (tens of MB), then HBM (tens of GB, highest capacity but slowest). That one sentence is the prereq. The rest you will pick up in context.
+
+\textbf{Conceptual prerequisites:} Undergraduate computer architecture (caches, memory hierarchies, pipelines). Comfort with Python and PyTorch.
+
+\textbf{Vocabulary gate.} Eight GPU terms used throughout. If any are unfamiliar, read Simon Boehm's ``How to Optimize a CUDA Matmul'' first ($\sim$2 hours).
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{7.5cm}l@{}}
+\toprule
+\textbf{Term} & \textbf{Meaning} & \textbf{Reference} \\
+\midrule
+Tiling & Breaking ops into sub-blocks that fit in fast memory & Boehm K1--3 \\
+Scheduling & How the GPU picks which thread groups run when & CUDA Guide Ch.~5 \\
+Warp / wavefront & 32 threads (NVIDIA) or 64 threads (AMD) in lockstep & CUDA Guide Ch.~4 \\
+GEMM & General Matrix Multiply ($C = AB$) & Boehm (entire blog) \\
+Register pressure & Too many registers/thread $\to$ fewer concurrent threads & Boehm K6--7 \\
+On-chip scratch & Fast die-level memory: shared memory (NVIDIA) / LDS (AMD) & Boehm K2+ \\
+Double buffering & Load next tile while computing current tile & Boehm K5--6 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Read before starting:} (1) Simon Boehm, ``How to Optimize a CUDA Matmul'' --- the table above references specific kernels; (2) AMD CDNA3 Architecture Whitepaper, Sections 1--3 (XCD topology, HBM3, MFMA units, $\sim$1 hour); (3) Wen-mei Hwu, ``Programming Massively Parallel Processors'' lectures on YouTube/Coursera, Chapters 4--6.
+
+\textbf{Reference during exercises:}
+\begin{itemize}
+  \item ROCm installation guide at \texttt{rocm.docs.amd.com}.
+  \item \texttt{rocprof} and \texttt{omniperf} profiling guides (skim now; you will use these as reference during Part~B).
+  \item AMD Instinct MI300X product page and launch blog post --- useful for verifying published specs against your measurements.
+\end{itemize}
+
+\textbf{Hardware:} Rent MI300X on Crusoe or TensorWave at $\sim$\$1.70/hr. Budget $\sim$\$200/month for this chapter. The benchmarking exercises (Parts~A--C) require $\sim$40--60 GPU-hours total if you avoid leaving instances idle.
+
+\textbf{Setup:} ROCm 6.x stack, PyTorch with ROCm backend, \texttt{rocblas} and \texttt{hipblaslt} for BLAS baselines.
+
+% -----------------------------------------------------------------------
+\subsection{Part A: Conceptual Foundation}
+% -----------------------------------------------------------------------
+
+\begin{thinkfirst}{AMD vs.\ NVIDIA Architecture: What Changes?}
+\textbf{The business question:} If we move RLVR training from H100 to MI300X, can we port our NVIDIA optimization playbook directly --- or does AMD's architecture require fundamentally different strategies? The answer determines whether the switch costs one week of engineering or three months. The four differences below are the ones that matter for RLVR workloads.
+
+\textbf{Execution width:} NVIDIA warps are 32 threads wide. AMD wavefronts are 64 threads wide. This means AMD processes twice as many elements per instruction cycle in a wavefront, but each wavefront needs twice as much work to stay busy. When vendor libraries (rocBLAS) tile a matmul internally, they account for this. When you see profiling output showing ``wavefront occupancy,'' low numbers mean the hardware is underutilized.
+
+\textbf{Local Data Share vs.\ shared memory:} MI300X LDS is 64~KB per compute unit; H100's shared memory is 48~KB (configurable up to 99~KB). More on-chip scratch means vendor kernels can hold larger tiles in fast memory. You do not need to manage this directly --- but when a kernel underperforms, LDS utilization in \texttt{omniperf} output tells you whether the on-chip memory is being used effectively.
+
+\textbf{MFMA vs.\ Tensor Cores:} AMD MFMA (Matrix Fused Multiply-Add) instructions operate on 16$\times$16 or 32$\times$32 tiles. NVIDIA Tensor Cores operate on 16$\times$16 tiles. Both accelerate matrix math in hardware; the programming interface differs, but vendor BLAS libraries abstract this. The key question for benchmarking: are the vendor libraries exploiting MFMA as effectively as NVIDIA's libraries exploit Tensor Cores?
+
+\textbf{GCD topology:} MI300X has 8 Graphics Compute Dies (XCDs), each with its own LDS. Inter-XCD communication goes through the Infinity Fabric, not shared L1. Workloads that touch memory across XCDs pay a latency penalty. \texttt{omniperf} can detect this. Keep it in mind when interpreting unexpected slowdowns.
+
+\begin{center}
+\begin{tikzpicture}[
+  xcd/.style={draw, thick, rounded corners=2pt, fill=aiiro!8,
+              minimum width=1.3cm, minimum height=1.3cm,
+              text centered, font=\scriptsize\bfseries},
+  fab/.style={draw=sumi!40, thick, fill=sumi!5, rounded corners=4pt},
+  link/.style={sumi!50, thick}
+]
+  % Infinity Fabric backbone
+  \node[fab, minimum width=10.5cm, minimum height=1cm] (fabric) at (4.7,0)
+    {\footnotesize\itshape Infinity Fabric};
+
+  % 8 XCDs
+  \foreach \i/\x in {0/0.5, 1/1.8, 2/3.1, 3/4.4, 4/5.7, 5/7.0, 6/8.3, 7/9.6} {
+    \node[xcd] (xcd\i) at (\x, 1.6) {XCD \i};
+    \draw[link] (xcd\i.south) -- (xcd\i.south |- fabric.north);
+  }
+
+  % HBM stacks below
+  \node[draw, thick, rounded corners=2pt, fill=matcha!8,
+        minimum width=10.5cm, minimum height=0.8cm,
+        font=\footnotesize] (hbm) at (4.7,-1.2)
+    {192 GB HBM3 \quad (5.3 TB/s aggregate bandwidth)};
+  \draw[link] (fabric.south) -- (hbm.north);
+
+  % Annotations
+  \node[font=\scriptsize\itshape, sumi!60, anchor=west] at (10.5,1.6)
+    {Each XCD has};
+  \node[font=\scriptsize\itshape, sumi!60, anchor=west] at (10.5,1.2)
+    {own LDS (64 KB)};
+  \node[font=\scriptsize\itshape, sumi!60, anchor=west] at (10.5,0)
+    {Inter-XCD: Fabric};
+\end{tikzpicture}
+\end{center}
+
+\textbf{HBM3 bandwidth:} MI300X delivers 5.3~TB/s; H100 delivers 3.35~TB/s --- a 1.58$\times$ advantage. This advantage only materializes for memory-bandwidth-bound operations. Predict: which RLVR operations are memory-bandwidth-bound, and which compute-bound?
+\end{thinkfirst}
+
+\begin{thinkfirst}{Roofline Analysis for MI300X}
+\textbf{The hypothesis:} MI300X has lower peak FLOP/s than H100 but higher memory bandwidth. This means its roofline ``ridge point'' is lower --- it becomes compute-bound at lower arithmetic intensity. The counterintuitive implication: for operations in the intermediate-intensity range ($72$--$148$~FLOP/byte), MI300X may deliver higher absolute throughput despite lower peak compute. This section derives the numbers that let you test this hypothesis in Part~B.
+
+The roofline model places operations on a two-regime map: memory-bound (performance $\propto$ bandwidth) vs.\ compute-bound (performance $\propto$ FLOP/s peak). The crossover is the \textit{arithmetic intensity ridge point}.
+
+\textbf{MI300X specs:} Peak BF16 compute $\approx 383$~TFLOP/s; peak memory bandwidth $= 5.3$~TB/s. Derive the ridge point:
+$$I^* = \frac{383 \times 10^{12} \text{ FLOP/s}}{5.3 \times 10^{12} \text{ B/s}} \approx 72 \text{ FLOP/byte}$$
+
+\textbf{Compare to H100:} Peak BF16 $\approx 989$~TFLOP/s (with sparsity; $\sim 495$ dense); bandwidth $= 3.35$~TB/s. H100 ridge point $\approx 148$~FLOP/byte (dense). The MI300X's ridge is lower --- it becomes compute-bound at \textit{lower} arithmetic intensity than H100. Counterintuitive result: for operations with intermediate arithmetic intensity ($72$--$148$~FLOP/byte), MI300X may deliver better absolute throughput even at lower peak FLOP/s.
+
+\textbf{BF16 matmul arithmetic intensity:} An $N \times N$ GEMM ($C = AB$, $A,B,C$ in BF16) performs $2N^3$ FLOPs and reads/writes $3 \times 2N^2$ bytes. Arithmetic intensity $= \frac{2N^3}{6N^2} = N/3$. At what $N$ is MI300X compute-bound? ($N/3 > 72 \Rightarrow N > 216$.) For a 7B model, typical sequence batch matmuls have $N \gg 216$ --- firmly compute-bound during training.
+
+\textbf{Autoregressive generation:} During decode, batch size is often 1--4 tokens. The weight matrix is $O(D^2)$ bytes; FLOPs are $O(D^2)$ per token but memory reads are also $O(D^2)$ --- arithmetic intensity $\approx 1$--$2$~FLOP/byte. Far below the ridge: \textit{pure memory-bandwidth bottleneck}. MI300X's 1.58$\times$ bandwidth advantage should give a near-linear generation speedup. You will verify this in Part~B.
+
+\textbf{Prediction log:} Before running a single benchmark, fill in this table for 5 RLVR operations: (operation, expected intensity, expected bound, expected AMD advantage). You will check this against measured results in Part~B.
+\end{thinkfirst}
+
+\begin{thinkfirst}{Why Generation Throughput Dominates RLVR Wall Time}
+\textbf{The prioritization question:} You have a fixed engineering budget. Which single operation should you optimize first to maximize wall-time savings on a multi-week RLVR run? Amdahl's Law makes this concrete --- the answer is not ``the slowest kernel'' but ``the largest fraction of total time.'' This box derives why generation dominates, and why MI300X's bandwidth advantage hits exactly the right bottleneck.
+
+RLVR training iterates: generate rollouts with the current policy, score them with a verifier, compute policy gradient, update weights. Repeat for weeks.
+
+\textbf{Amdahl's Law applied:} Suppose generation consumes 60\% of wall time and the training step (forward + backward + optimizer) consumes 40\%. If you speed up generation by 2$\times$:
+$$\text{Speedup} = \frac{1}{0.40 + 0.60/2} = \frac{1}{0.70} \approx 1.43\times$$
+If instead you speed up the matmul inside the training step by 2$\times$, and matmul is 50\% of that 40\% step (20\% of total wall time):
+$$\text{Speedup} = \frac{1}{0.80 + 0.20/2} = \frac{1}{0.90} \approx 1.11\times$$
+
+A 2$\times$ generation improvement beats a 2$\times$ matmul improvement by 29 percentage points of pipeline speedup. Over a 3-week run, the 1.43$\times$ speedup saves 8.5 days vs.\ 2.3 days.
+
+\textbf{Why MI300X's bandwidth advantage is structural here:} Generation is memory-bandwidth-bound by the KV~cache and weight loading. The roofline ceiling is bandwidth. MI300X's 1.58$\times$ bandwidth advantage translates almost directly to 1.58$\times$ generation throughput. This is the hardware bet. The rest of this chapter tests whether the software stack delivers it.
+
+\textbf{Numerical stability matters more in RL:} Unlike supervised learning, a gradient explosion mid-run wastes weeks of compute, not hours. Before optimizing for throughput, you need to understand what precision regime keeps gradients stable. This is why Part~B Op~4 focuses on mixed-precision training with gradient norm monitoring --- not just raw TFLOP/s.
+
+\textbf{Write your answer before proceeding:} Which single operation should you optimize first on MI300X to maximize RLVR training throughput? Why? If your answer is not ``autoregressive generation,'' re-read this box.
+\end{thinkfirst}
+
+% -----------------------------------------------------------------------
+\subsection{Part A Exercises: Roofline Verification}
+% -----------------------------------------------------------------------
+
+\begin{exercise}{Verify Your Roofline Predictions with rocBLAS (3--4 hours)}
+The Think First boxes produced predictions about where MI300X is bandwidth-bound vs.\ compute-bound. This exercise tests those predictions empirically using vendor libraries. You are not writing kernels --- you are building measurement fluency on AMD hardware.
+
+\textbf{Step 1: rocBLAS matmul baseline.}
+Call \texttt{rocblas\_gemm} (via PyTorch: \texttt{torch.matmul} on ROCm) for BF16 square matrices at sizes $N \in \{256, 512, 1024, 2048, 4096, 8192\}$. For each $N$:
+\begin{itemize}
+  \item Compute TFLOP/s: $2N^3 / \text{time}$.
+  \item Compute achieved HBM bandwidth: $6N^2 / \text{time}$ (assuming $A$, $B$, $C$ each read/written once).
+  \item Compute arithmetic intensity: $N/3$.
+  \item Plot on a roofline diagram with the MI300X ceiling (383~TFLOP/s compute, 5.3~TB/s bandwidth).
+\end{itemize}
+
+Use \texttt{torch.cuda.synchronize()} for accurate timing. Warm up 10 iterations; measure 100 iterations; report median. If you cannot reach 80\% of theoretical peak at $N = 8192$, something is wrong with your setup --- fix it before proceeding.
+
+\textbf{Step 2: Verify the bandwidth-bound regime.}
+Repeat the measurement at $N \in \{64, 128, 256\}$ --- below the MI300X ridge point ($N = 216$). Verify that achieved TFLOP/s tracks bandwidth (i.e., scales with $N^2$, not $N^3$). Plot these points on the same roofline diagram and confirm they fall on the bandwidth-bound slope.
+
+\textbf{Step 3: Profile one operation.}
+Pick $N = 4096$. Run \texttt{omniperf profile} on the matmul. Identify in the output: (a) MFMA utilization, (b) HBM bandwidth utilization, (c) LDS utilization. Write one paragraph interpreting the profile: is this operation compute-bound or memory-bound according to the profiler, and does it match your roofline prediction?
+
+\textbf{Record:} TFLOP/s at each $N$, \% of BF16 theoretical peak (383 TFLOP/s), roofline plot, omniperf interpretation paragraph.
+\end{exercise}
+
+\begin{exercise}{Memory Capacity Calculations (1 hour)}
+MI300X's 192~GB vs.\ H100's 80~GB unlocks workloads that are impossible on NVIDIA. Work through the arithmetic, then verify experimentally.
+
+\textbf{KV~cache capacity.}
+For a 7B model in BF16: KV~cache per token per layer $= 2 \times 2 \times D_{\text{head}} \times H_{\text{heads}} = 2 \times 2 \times 128 \times 32 = 16{,}384$~bytes $= 16$~KB. For 32 layers: $512$~KB per token.
+
+At what context length does the KV~cache alone fill 80~GB? (Answer: $\approx 160$K tokens.) At what length does it fill 192~GB? ($\approx 375$K tokens.) Verify by loading a 7B model in BF16 and running generation until OOM on MI300X. Record the actual max context length.
+
+\textbf{MoE memory budget.}
+An 8-expert MoE (2 active per token) with 7B-parameter MLP blocks per expert: $8 \times 7\text{B} \times 2~\text{bytes} = 112$~GB for BF16 weights. On H100 (80~GB): does not fit without offloading. On MI300X (192~GB): fits with 80~GB remaining for KV~cache, activations, and optimizer state. At what context length does the remaining 80~GB for KV~cache run out? (Use the per-token calculation above.)
+
+\textbf{Record:} Calculated vs.\ measured max context lengths. The context length at which MI300X enables workloads impossible on a single H100. This number appears in your Part~C memo.
+\end{exercise}
+
+% -----------------------------------------------------------------------
+\subsection{Part B: RLVR Operations Benchmark}
+% -----------------------------------------------------------------------
+
+\begin{exercise}{RLVR Operations Benchmark on MI300X (15--20 hours)}
+Part~A verified your roofline intuitions. Part~B answers the chapter's central question: \textit{does MI300X's hardware advantage survive real RLVR workloads?} For each operation: (1) state why it appears in RLVR training, (2) run the benchmark, (3) compare to H100 published numbers or your own H100 measurements if available.
+
+\textbf{Benchmark harness:} Write a single Python script that runs all 5 operations, logs results to a JSON file, and prints a summary table. Use \texttt{torch.cuda.synchronize()} (which maps to \texttt{torch.hip.synchronize()} on ROCm) for accurate timing. Warm up 10 iterations; measure 100 iterations; report median and p95 latency.
+
+\medskip
+\textbf{Operation 1: Autoregressive Generation Throughput.} \textit{The RLVR bottleneck.}
+
+RLVR spends 50--70\% of wall time generating rollouts. Each rollout is autoregressive: one token at a time, loading the full weight matrix and KV~cache at every step. This is memory-bandwidth-bound.
+
+Load a 7B-parameter model in BF16 (\textasciitilde{}14~GB). Generate 512 tokens with batch sizes $\{1, 4, 8, 16, 32\}$. Measure tokens/second end-to-end (including KV~cache updates). MI300X's 5.3~TB/s should give $\approx 1.58\times$ vs.\ H100's 3.35~TB/s, since the bottleneck is weight loading bandwidth. Verify. If you observe less than $1.3\times$ speedup, profile KV~cache overhead separately --- the gap is likely in attention kernel efficiency or RCCL initialization overhead, not raw HBM bandwidth.
+
+\textbf{Measure:} Tokens/second at each batch size. Roofline utilization (achieved HBM bandwidth / 5.3~TB/s). Ratio vs.\ H100 baseline.
+
+\medskip
+\textbf{Operation 2: Flash Attention Kernel.} \textit{The training compute kernel.}
+
+Flash Attention fuses the attention computation to avoid materializing the full $N \times N$ attention matrix. On AMD, the reference implementation is in \texttt{composable\_kernel} (AMD's equivalent of CUTLASS). Alternatively, use \texttt{flash-attention} with the ROCm backend if available for your ROCm version.
+
+Run for sequence lengths $\{512, 1024, 2048, 4096, 8192\}$, head dim 128, 32 heads, batch size 4. Compare to FlashAttention-2 on H100 (TFLOP/s numbers from Tri Dao's paper are public). Measure both forward and backward pass. If \texttt{composable\_kernel} FA underperforms by $>30\%$ vs.\ H100, identify whether the gap is in the MFMA utilization or the softmax numerics --- these have different fixes.
+
+\textbf{Measure:} TFLOP/s (fwd), TFLOP/s (bwd), \% of theoretical MI300X peak, ratio vs.\ FlashAttention-2 H100.
+
+\medskip
+\textbf{Operation 3: All-Reduce (RCCL).} \textit{The distributed training bottleneck.}
+
+Multi-GPU RLVR training synchronizes gradients via all-reduce after each backward pass. On NVIDIA, NCCL is battle-hardened. AMD uses RCCL (ROCm Collective Communication Library).
+
+Using 4 MI300X GPUs (rent a 4-GPU node), run RCCL all-reduce at message sizes $\{1\text{MB}, 10\text{MB}, 100\text{MB}, 1\text{GB}, 10\text{GB}\}$. Plot bandwidth utilization (achieved GB/s / theoretical Infinity Fabric bandwidth). Compare to published NCCL numbers at equivalent message sizes. Key question: does RCCL's bandwidth utilization fall off at small message sizes (the latency-dominated regime) --- and what is the crossover message size where it becomes bandwidth-efficient? For a 7B model, gradient tensors are $\sim$14~GB total --- is this in the efficient regime?
+
+\textbf{Measure:} All-reduce bandwidth (GB/s) at each message size, \% of Infinity Fabric peak, ratio vs.\ NCCL H100.
+
+\medskip
+\textbf{Operation 4: Mixed-Precision Training Step.} \textit{Throughput + stability.}
+
+A realistic training step: BF16 for weight storage, FP8 for activation matmul (where supported by ROCm), FP32 accumulation for gradient updates. This matches the precision hierarchy used in production RLVR.
+
+Construct a minimal training loop: 2-layer transformer, 7B-parameter size, batch size 4, sequence length 512. Run 100 forward-backward-optimizer steps. Measure: (a) TFLOP/s of the matmul-heavy forward pass, (b) gradient norm at each step --- flag if norm exceeds $10\times$ the initial norm (instability signal), (c) wall time per step.
+
+RL rewards are often sparse and bursty --- gradient norms spike around reward events. FP8 accumulation may be fine for supervised training but unstable for RL. Document what you find.
+
+\textbf{Measure:} TFLOP/s, gradient norm variance, wall time/step, any instability events.
+
+\medskip
+\textbf{Operation 5: Decode-Path Attention.} \textit{The KV~cache memory movement problem.}
+
+Autoregressive decode is not a matmul problem --- it is a memory movement problem. During decode step $t$, the model reads the full KV~cache (all $t$ previous tokens), computes attention scores, and writes one new KV pair. This is an irregular memory access pattern that MFMA instructions do not directly accelerate.
+
+Use \texttt{composable\_kernel} decode attention kernels (or \texttt{xformers} with ROCm backend). Profile with \texttt{omniperf}: what fraction of the decode step is (a) KV~cache reads, (b) attention score computation, (c) KV write? At sequence length 4096, what is the ratio of memory bandwidth consumed to FLOPs performed? Does this match the $\approx 1$~FLOP/byte prediction from the roofline Think First box?
+
+\textbf{Measure:} KV~cache read bandwidth (GB/s), FLOPs/s for attention scoring, HBM bandwidth utilization as \% of 5.3~TB/s, ratio vs.\ H100 decode attention benchmark.
+\end{exercise}
+
+% -----------------------------------------------------------------------
+\subsection{Part C: Intelligence-per-Watt Analysis}
+% -----------------------------------------------------------------------
+
+\begin{thinkfirst}{Predict Before You Measure: Intelligence-per-Watt}
+Before running Part~C analysis, write down your predictions. Return to this box and grade yourself after.
+
+MI300X TDP: 750~W. H100 SXM TDP: 700~W. The MI300X consumes 7\% more power. For AMD to win on intelligence-per-Watt, it must deliver $>7\%$ more useful throughput on a given operation.
+
+\textbf{Predict for each Part~B operation:}
+\begin{enumerate}
+  \item Autoregressive generation: AMD wins/loses? Why?
+  \item Flash Attention forward: AMD wins/loses? What determines the efficiency ratio?
+  \item All-reduce (RCCL vs.\ NCCL): AMD wins/loses? What is the primary source of software overhead?
+  \item Mixed-precision training step: AMD wins/loses? Does FP8 throughput on MFMA vs.\ Tensor Cores change the picture?
+  \item Decode-path attention: AMD wins/loses? Is this determined by bandwidth or kernel quality?
+\end{enumerate}
+
+\textbf{Write your predictions now.} Do not read Part~C exercise results first.
+\end{thinkfirst}
+
+\begin{exercise}{Intelligence-per-Watt Analysis (2--3 hours)}
+Using the benchmark results from Parts~A and~B, build the analysis that justifies or refutes AMD investment for RLVR.
+
+\textbf{Step 1: Compute useful throughput per Watt.} For each Part~B operation, record: (achieved throughput on MI300X) / 750~W and (H100 benchmark throughput) / 700~W. Use tokens/s for generation; TFLOP/s for matmul and attention; GB/s for all-reduce. Build a table with columns: Operation, MI300X metric, H100 metric, MI300X/W, H100/W, Ratio.
+
+\textbf{Step 2: Gap analysis.} For operations where MI300X loses on per-Watt efficiency, categorize the gap source:
+\begin{itemize}
+  \item \textit{Software immaturity} --- kernel not yet optimized (RCCL, FA): closable with engineering.
+  \item \textit{Compiler gap} --- \texttt{hipcc} generating worse code than \texttt{nvcc} for a class of patterns: harder to close, may require upstream ROCm contributions.
+  \item \textit{Architectural mismatch} --- the operation genuinely suits NVIDIA's architecture better (e.g., Tensor Core scheduling, warp-level primitives): structural disadvantage.
+\end{itemize}
+For each gap, estimate engineering effort to close: $<1$~person-week, 1--4~person-weeks, $>1$~person-month, or ``architectural, cannot close.''
+
+\textbf{Step 3: Write the memo.} One page, structured as follows:
+\begin{enumerate}
+  \item \textbf{Recommendation} (one sentence): Should a frontier lab invest in MI300X for RLVR training, and under what conditions?
+  \item \textbf{Hardware case} (2--3 bullets): The specific operations where AMD wins on intelligence-per-Watt and why the win is structural.
+  \item \textbf{Risks} (2--3 bullets): The specific gaps, their sources, and engineering cost to close.
+  \item \textbf{Decision trigger} (1 paragraph): What would need to be true for the answer to change? E.g., ``If RCCL reaches NCCL parity at the 10~GB message size, the all-reduce gap closes and the hardware case strengthens by X\%.''
+\end{enumerate}
+
+\textbf{Verification:} Your analysis must identify at least one operation where AMD wins on intelligence-per-Watt AND at least one where it loses. If your analysis shows AMD wins everywhere, you have not stress-tested the software gaps. If it shows AMD loses everywhere, you have not accounted for the bandwidth and memory-capacity advantages.
+\end{exercise}
+
+% -----------------------------------------------------------------------
+\subsection{Portfolio Project}
+% -----------------------------------------------------------------------
+
+\begin{portfolio}{Evaluating AMD MI300X for Large-Scale RLVR Training}
+\textbf{Deliverable:} Public blog post + open-source repository. Estimated total time: 25--35 hours including Parts~A--C.
+
+\textbf{Blog post structure:} The roofline analysis (Part~A) is the conceptual hook --- it gives readers a framework for reasoning about when AMD wins and why. The benchmark suite (Part~B) is the empirical substance. The gap analysis (Part~C) is what makes it actionable. The narrative thread: ``I set out to understand whether AMD's hardware advantage survives real RLVR workloads. Here is what I found, operation by operation.''
+
+\textbf{The monkey:} Does MI300X's 1.58$\times$ bandwidth advantage actually translate to faster RLVR training end-to-end, or does software ecosystem immaturity (RCCL, composable\_kernel, compiler maturity) erase the hardware advantage? The benchmark harness answers this empirically. The gap analysis answers what would need to change for the answer to flip. That combination --- empirical data plus actionable gap analysis --- is what makes the project decision-useful rather than merely educational.
+
+\textbf{Verification criteria:}
+\begin{enumerate}
+  \item The analysis identifies $\geq 1$ operation where AMD wins on intelligence-per-Watt.
+  \item The analysis identifies $\geq 1$ operation where AMD loses, with a categorized gap source.
+  \item The gap analysis includes a concrete engineering effort estimate ($<$1 week / 1--4 weeks / $>$1 month / architectural) for each gap.
+  \item The benchmark harness is reproducible by a third party with access to a single MI300X instance at the stated ROCm version.
+  \item Total cloud cost to reproduce is documented and is under \$200.
+\end{enumerate}
+\end{portfolio}
+
+% -----------------------------------------------------------------------
+\subsection{Optional Deep Dive: HIP Kernel Writing}
+% -----------------------------------------------------------------------
+
+\textit{Prerequisite: Complete Chapter~1 (CUDA Kernel Optimization) first. This section ports kernel intuitions from NVIDIA to AMD and is not required for the portfolio project.}
+
+\begin{exercise}{HIP Matmul: Naive to MFMA in 2 Kernels (6--10 hours)}
+This exercise builds direct AMD kernel experience. The profiling and diagnosis loop is the pedagogy: after each kernel, measure, profile with \texttt{omniperf}, form a hypothesis about the bottleneck, then write the next kernel to address it.
+
+\textbf{Kernel~1: Naive HIP with LDS Tiling.}
+Start with the simplest possible kernel: one thread computes one output element $C[i,j]$ by iterating over the $k$ dimension. Measure TFLOP/s --- expect $<5\%$ of rocBLAS. Then add memory coalescing and LDS blocking. Tile size: start with $64 \times 64$; AMD's LDS is 64~KB, so a $64 \times 64$ BF16 tile is $64^2 \times 2 = 8$~KB; you can hold 8 such tiles. Double-buffer: load tile $k$ into LDS while computing tile $k-1$.
+
+\textbf{AMD-specific pitfall:} Wavefronts are 64-wide (vs.\ CUDA's 32-wide warps). If your thread block is $32 \times 32 = 1024$ threads, you have 16 wavefronts. The LDS bank structure is 32 banks, but the stride pattern for 64-wide accesses differs from CUDA. Profile with \texttt{omniperf --dispatch-ids} to catch LDS bank conflicts.
+
+\textbf{Record:} TFLOP/s, \% of rocBLAS, LDS bandwidth utilization, bank conflict rate.
+
+\medskip
+\textbf{Kernel~2: MFMA + Wavefront Tiling.}
+Replace scalar FMA with MFMA instructions. Use \texttt{\_\_builtin\_amdgcn\_mfma\_f32\_32x32x8\_bf16} for 32$\times$32$\times$8 BF16 MFMA. Each MFMA instruction consumes registers from the full 64-wide wavefront --- you must lay out your register file so that each lane holds the correct $A$ and $B$ fragments. Tile dimensions: outer tile 128$\times$128 (computed by the thread block), inner tile 32$\times$32 (computed by one MFMA per wavefront).
+
+\textbf{Profiling checkpoint:} Run \texttt{omniperf} and check VALU (vector ALU) utilization vs.\ MFMA utilization. If VALU is high and MFMA is low, your kernel is spending time on address computation, not matrix math.
+
+\textbf{Target:} $>50\%$ of rocBLAS TFLOP/s. If you fall short, profile and identify the binding constraint before declaring done. Common culprits: register spilling (check SGPRs/VGPRs in \texttt{rocprof} output), LDS bank conflicts, insufficient wavefront occupancy.
+
+\textbf{Record:} TFLOP/s, \% of rocBLAS, VALU utilization, MFMA utilization, wavefront occupancy.
+
+\medskip
+\textbf{Diagnostic discipline:} After each kernel, write one paragraph: what was the bottleneck, how did you diagnose it, what did you change, what was the result.
+\end{exercise}
+
+\newpage

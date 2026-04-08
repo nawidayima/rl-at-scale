@@ -1,0 +1,396 @@
+\section{NVIDIA CUDA/Blackwell Kernel Optimization}
+
+\smallskip
+
+\begin{whythis}
+RLVR training spends weeks generating rollouts, scoring them, and updating the policy. The wall-time bottleneck is autoregressive generation --- memory-bandwidth-bound, one token at a time. The 3--5 kernels that dominate this bottleneck (attention, KV-cache update, weight matmul) are hand-written CUDA at frontier labs. Understanding why each optimization works --- not just that it works --- is the skill this chapter builds.
+
+The governing metric is \textit{intelligence per Watt}: useful inference throughput per joule. The progression follows Simon Boehm's SGEMM\_CUDA project (13 kernels, naive to 93.7\% of cuBLAS), then extends to Blackwell-specific features: TMEM, native FP4/FP6, and thread block clusters.
+\end{whythis}
+
+\subsection{Prerequisites and Hardware}
+
+\textbf{GPU mental model.} A GPU has many \textit{Streaming Multiprocessors} (SMs), each running thousands of threads in parallel. Threads are grouped into \textit{warps} (32 threads that execute the same instruction in lockstep). Each SM has fast \textit{shared memory} (tens of KB, programmer-managed) and access to slow \textit{HBM} (tens of GB, high capacity). \textit{Tensor Cores} are specialized hardware units on each SM that accelerate matrix multiply-accumulate operations. The fundamental optimization challenge: keep the Tensor Cores fed with data by managing the memory hierarchy (registers $>$ shared memory $>$ L2 cache $>$ HBM) so data is reused from fast memory rather than re-fetched from slow memory. Everything in this chapter is a variation on that theme.
+
+\begin{center}
+\begin{tikzpicture}[
+  mem/.style={draw, thick, rounded corners=3pt, minimum width=3.4cm, minimum height=0.9cm,
+              text centered, font=\small},
+  lbl/.style={font=\footnotesize\itshape, text width=3cm, align=left},
+  arr/.style={-{Stealth[length=5pt]}, thick, sumi!50}
+]
+  \node[mem, fill=beni!8]   (reg) {Registers};
+  \node[mem, fill=kitsune!8, below=0.35cm of reg] (smem) {Shared Memory / L1};
+  \node[mem, fill=kitsune!30!white, below=0.35cm of smem] (l2)   {L2 Cache};
+  \node[mem, fill=aiiro!8,   below=0.35cm of l2]   (hbm)  {HBM (Global Memory)};
+
+  \node[lbl, right=0.6cm of reg]  {fastest, smallest\\$\sim$256 KB/SM};
+  \node[lbl, right=0.6cm of smem] {programmer-managed\\48--228 KB/SM};
+  \node[lbl, right=0.6cm of l2]   {hardware-managed\\50 MB};
+  \node[lbl, right=0.6cm of hbm]  {slowest, largest\\80--192 GB};
+
+  \draw[arr] (hbm) -- (l2);
+  \draw[arr] (l2) -- (smem);
+  \draw[arr] (smem) -- (reg);
+
+  \node[font=\footnotesize, sumi!60, left=0.4cm of smem, rotate=90, anchor=south] {increasing speed};
+  \node[font=\footnotesize, sumi!60, left=0.4cm of l2, rotate=90, anchor=north] {increasing capacity};
+\end{tikzpicture}
+\end{center}
+
+\textbf{Reading:} Boehm's SGEMM\_CUDA repository (\texttt{github.com/siboehm/SGEMM\_CUDA}) and accompanying blog post ``How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance'' --- read this first, it is the foundation for Part~B; CUDA Programming Guide chapters on shared memory, warp execution, and tensor cores; Tri Dao's Flash Attention papers (v1 and v2); the Blackwell Architecture Whitepaper (GTC 2024); Nsight Compute user guide.
+
+\textbf{Companion reference:} Clone Boehm's SGEMM\_CUDA repo from \url{https://github.com/siboehm/SGEMM\_CUDA}. It implements kernels 0--13 with profiling scaffolding.
+
+\textbf{Hardware:} H100 SXM at $\sim$\$2/hr (Parts~B and~D--E, Lambda Labs or CoreWeave); B200 at $\sim$\$2.25/hr (Part~C, available via Azure or specialized providers). Budget $\sim$\$250/month. Total estimated spend for the full chapter: \$80--\$120 if you avoid leaving instances idle.
+
+\textbf{Setup:} CUDA 12.4+, cuBLAS, Nsight Compute (\texttt{ncu}), PyTorch for Triton baseline, \texttt{nvcc} with \texttt{-arch=sm\_90} (H100) or \texttt{-arch=sm\_100} (B200).
+
+% -----------------------------------------------------------------------
+\subsection{Part A: Conceptual Foundation}
+% -----------------------------------------------------------------------
+
+\begin{thinkfirst}{Hopper vs.\ Blackwell: What Changes About Your Optimization Strategy?}
+Before touching any kernel code, reason through the architectural differences. Not every Hopper technique ports cleanly to Blackwell, and Blackwell introduces primitives that require new mental models.
+
+\textbf{Hopper (H100):} 80~GB HBM3 at 3.35~TB/s; 132 SMs each with 256~KB L1 cache (configurable as up to 228~KB shared memory); Tensor Core gen~4 supporting FP8/BF16/FP16/TF32/FP32; thread block cluster size up to 8; no TMEM.
+
+\textbf{Blackwell (B200):} 192~GB HBM3e at 8~TB/s (2.4$\times$ over H100); TMEM (Tensor Memory) --- a new on-chip memory space separate from shared memory, reserved for Tensor Core accumulators; native FP4 and FP6 data types with hardware Tensor Core support; thread block clusters up to size~16; NVLink 5 for multi-GPU.
+
+\textbf{What changes:}
+\begin{itemize}
+  \item \textbf{Roofline ridge point:} At BF16, B200 peak compute is $\sim 4500$~TFLOP/s (dense); bandwidth is $8$~TB/s. Ridge: $4500/8 = 562$~FLOP/byte. H100 ridge is $\sim 148$~FLOP/byte (dense BF16). Operations that were memory-bound on H100 can become compute-bound on B200 --- including medium-batch inference matmuls.
+
+\begin{center}
+\begin{tikzpicture}[
+  scale=0.9,
+  every node/.style={font=\footnotesize}
+]
+  % Axes
+  \draw[-{Stealth[length=5pt]}, thick] (0,0) -- (7.5,0)
+    node[right] {Arithmetic Intensity (FLOP/byte)};
+  \draw[-{Stealth[length=5pt]}, thick] (0,0) -- (0,5.5)
+    node[above, rotate=90, anchor=south, yshift=3mm] {Attainable TFLOP/s};
+
+  % H100 roofline
+  \draw[aiiro!70, very thick]
+    (0,0) -- (3.8,3.8) -- (7,3.8)
+    node[right, aiiro!70] {H100 (495 dense)};
+  \draw[aiiro!70, dashed, thin] (3.8,0) -- (3.8,3.8);
+  \node[aiiro!70, below] at (3.8,0) {148};
+
+  % B200 roofline
+  \draw[beni!70, very thick]
+    (0,0) -- (5.2,5.2) -- (7,5.2)
+    node[right, beni!70] {B200 (4500)};
+  \draw[beni!70, dashed, thin] (5.2,0) -- (5.2,5.2);
+  \node[beni!70, below] at (5.2,0) {562};
+
+  % Decode region
+  \fill[matcha!15, rounded corners=2pt] (0.15,0.15) rectangle (1.2,1.5);
+  \node[font=\scriptsize, matcha!50!black, text width=1.2cm, align=center] at (0.67,0.85)
+    {decode\\(BW-bound)};
+
+  % Training region
+  \fill[aiiro!15!beni!5, rounded corners=2pt] (4.5,3.5) rectangle (6.5,5.0);
+  \node[font=\scriptsize, aiiro!50!black, text width=1.8cm, align=center] at (5.5,4.25)
+    {training matmul\\(compute-bound)};
+\end{tikzpicture}
+\end{center}
+
+\smallskip
+\noindent\textit{Conceptual roofline (not to log-scale). Decode-phase operations cluster in the bandwidth-bound regime; training matmuls cluster in the compute-bound regime. The gap between H100 and B200 ceilings is largest in the compute-bound region.}
+
+  \item \textbf{TMEM:} Accumulator registers can now reside in TMEM rather than the register file. This reduces register pressure and enables larger tile sizes without spilling.
+  \item \textbf{FP4/FP6:} At FP4, each element is 0.5 bytes. A 4096$\times$4096 weight matrix in FP4 is 8~MB vs.\ 32~MB in FP16. The bandwidth savings compound: fewer bytes to read, and Tensor Cores execute more FP4 ops per cycle than FP16 ops.
+  \item \textbf{Cluster size 16:} Hopper introduced thread block clusters at size~8. Blackwell doubles this to 16. A cluster of 16 blocks shares distributed shared memory (DSMEM) via the NVLink fabric, enabling tiles up to $16 \times \text{block\_shared\_mem}$ without HBM round-trips.
+\end{itemize}
+
+\textbf{What stays the same:} The memory hierarchy reasoning --- registers $>$ shared memory (or TMEM) $>$ L2 $>$ HBM --- is unchanged. Tiling, double-buffering, coalescing, and avoiding bank conflicts all apply on Blackwell with the same logic.
+
+\textbf{Write before proceeding:} For a batched matmul at inference time (batch size 64, $M=N=K=4096$, FP16 weights): is this compute-bound or memory-bound on H100? On B200? Does your answer change at batch size 1? At FP4 precision? Compute arithmetic intensity for each case before checking against the roofline.
+\end{thinkfirst}
+
+\begin{thinkfirst}{When Triton Beats Hand-Written CUDA}
+Triton is a Python DSL that compiles to efficient PTX. It auto-tiles, auto-vectorizes, and manages shared memory layout. For a standard FP16 matmul, Triton matches 90\%+ of hand-written CUDA with roughly 10$\times$ less code. Why write CUDA at all?
+
+\textbf{Where Triton wins:}
+\begin{itemize}
+  \item \textbf{Iteration speed:} A Triton matmul is $\sim$50 lines vs.\ $\sim$500 for hand-written CUDA with warptiling. For prototyping attention variants or quantization schemes, Triton lets you iterate in hours instead of days.
+  \item \textbf{Auto-tuning:} Triton's \texttt{@triton.autotune} searches the tile-size space automatically.
+  \item \textbf{Compiler improvements:} Kernels that were 20\% below cuBLAS in 2022 are now within 5\% in 2025 for many shapes.
+\end{itemize}
+
+\textbf{Where hand-written CUDA wins:}
+\begin{itemize}
+  \item \textbf{Custom memory layouts:} Triton assumes a block-based memory model. Non-standard shared memory layouts (e.g., transposed tiles for a specific warp schedule) cannot be expressed.
+  \item \textbf{Warp-level scheduling:} Hand-written CUDA lets you interleave MMA and load instructions at warp granularity, hiding memory latency. Triton schedules at block granularity.
+  \item \textbf{TMEM and FP4:} As of early 2026, Triton does not expose TMEM or native FP4 Tensor Core instructions. Blackwell-specific features require CUDA or PTX.
+  \item \textbf{Flash Attention:} The highest-performance versions use hand-written CUDA to control warp scheduling precisely, though Triton implementations exist.
+\end{itemize}
+
+\textbf{The practical rule:} Use Triton for prototyping and non-critical-path operations. Use hand-written CUDA for the 3--5 kernels that dominate RLVR wall time: autoregressive attention, KV-cache update, and the generation-side matmul. Part~D makes the performance gap concrete.
+
+\textbf{Write before proceeding:} For RLVR generation at batch size 8 with a 7B model: which single kernel do you expect to contribute most to wall time? Is Triton likely sufficient for production use of that kernel, or do you need hand-written CUDA? Justify with roofline arithmetic.
+\end{thinkfirst}
+
+\begin{thinkfirst}{Arithmetic Intensity Shift: FP16 $\to$ FP8 $\to$ FP4}
+As precision decreases, bytes per element halve (FP16: 2~B; FP8: 1~B; FP4: 0.5~B). Simultaneously, Tensor Cores at lower precision execute more operations per cycle: Blackwell FP4 throughput is roughly $4\times$ higher than FP16. This combination shifts the roofline ridge point dramatically.
+
+\textbf{B200 specifications by precision (approximate):}
+\begin{itemize}
+  \item FP16/BF16: $\sim 4500$~TFLOP/s dense; bandwidth 8~TB/s; ridge $\approx 562$~FLOP/byte
+  \item FP8: $\sim 9000$~TFLOP/s; bandwidth 8~TB/s; ridge $\approx 1125$~FLOP/byte
+  \item FP4: $\sim 18000$~TFLOP/s; bandwidth 8~TB/s; ridge $\approx 2250$~FLOP/byte
+\end{itemize}
+
+\textbf{Matmul arithmetic intensity:} An $N \times N$ GEMM with FP4 inputs performs $2N^3$ FLOPs and reads $3 \times 0.5N^2$ bytes (FP4 A, B, C). Intensity $= 2N^3 / (1.5N^2) = (4/3)N$.
+
+\textbf{Work out these cases} before proceeding:
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\hline
+\textbf{Precision} & $N=1024$ & $N=2048$ & $N=4096$ & $N=8192$ \\
+\hline
+FP16 intensity (FLOP/byte) & 341 & 683 & 1365 & 2731 \\
+FP16 bound on B200? & compute & compute & compute & compute \\
+FP4 intensity (FLOP/byte) & 1365 & 2731 & 5461 & 10923 \\
+FP4 bound on B200? & compute & compute & compute & compute \\
+\hline
+\end{tabular}
+\end{center}
+
+\textit{Note: at $N=1024$, FP4 intensity (1365) exceeds the FP4 ridge (2250)? Check your arithmetic. The ridge for FP4 is $\sim 2250$~FLOP/byte, so $N=1024$ gives intensity 1365~FLOP/byte, which is \textbf{below} the ridge --- memory-bound at FP4. At $N=2048$, intensity 2731 exceeds 2250 --- compute-bound. Is there any $(N, \text{precision})$ pair in the table that is memory-bound? What does that tell you about FP4 for small-batch inference on B200?}
+
+\textbf{RLVR implication:} During generation (decode phase), batch size is small and sequence length grows. The effective ``N'' for the weight matmul is the batch size $\times$ head dimension, which at batch size 1 is far below 2048. At batch size 1 with FP4 weights, you are \textit{memory-bound} on B200 despite FP4's computational advantage --- the bandwidth savings (4$\times$ fewer bytes) are the primary benefit, not the compute throughput. The B200's 8~TB/s bandwidth matters more than its FP4 TFLOP/s for single-stream generation.
+\end{thinkfirst}
+
+% -----------------------------------------------------------------------
+\subsection{Part B: The Boehm Progression on H100}
+% -----------------------------------------------------------------------
+
+\begin{exercise}{CUDA Matmul: Studying the Boehm Kernels 0--7 (15--20 hours)}
+This is the core credentialing exercise. The SGEMM\_CUDA repo implements all kernels; your job is to \textit{study the code, run each kernel, profile it, and explain why each optimization works}. The learning is in the profiling and diagnosis loop, not in writing kernels from scratch. After each kernel: measure TFLOP/s, compute \% of cuBLAS, profile with Nsight Compute (\texttt{ncu}), and identify the specific bottleneck that the next kernel addresses. Do not advance until you can write a one-sentence causal explanation: ``Kernel $k+1$ is faster than Kernel $k$ because \underline{\phantom{xxx}}.''
+
+Compile with \texttt{nvcc -O3 -arch=sm\_90 --use\_fast\_math}. Benchmark at $N \in \{1024, 2048, 4096\}$ with 100 warm-up iterations and 1000 timed iterations. Report median TFLOP/s.
+
+\medskip
+\textbf{Kernel 0: cuBLAS Baseline.}
+Call \texttt{cublasSgemm} (FP32) for your three matrix sizes. Record TFLOP/s as your ceiling. cuBLAS uses internal heuristics to select its kernel; for large $N$ on H100, it uses a warptiled HMMA kernel. Your Kernel~7 target is 70\%+ of this number (Boehm reached 93.7\% on an A6000; H100's higher-performance cuBLAS raises the bar).
+
+\textbf{Record:} TFLOP/s at each $N$; bandwidth utilization from Nsight.
+
+\medskip
+\textbf{Kernel 1: Naive (1 thread per output element).}
+One thread computes \texttt{C[row][col]} by looping over $k$. Global memory is accessed non-coalescingly: thread $(i,j)$ reads column $j$ of $B$ with stride-$N$ between consecutive $k$ values --- each access hits a separate cache line.
+
+\textbf{Profile:} Use \texttt{ncu --metrics l1tex\_\_t\_bytes\_pipe\_lsu\_mem\_global\_op\_ld.sum} to measure global load throughput. Expect $<5\%$ of cuBLAS.
+
+\textbf{Predict before measuring:} Given HBM3 bandwidth at 3.35~TB/s and the arithmetic intensity of this naive kernel ($\approx 1$~FLOP/byte due to no data reuse), what is the theoretical TFLOP/s ceiling? Does your measurement match?
+
+\medskip
+\textbf{Kernel 2: Global Memory Coalescing.}
+The fix: remap threads so that threads in a warp access consecutive memory addresses. Thread $(t_x, t_y)$ in a $32 \times 32$ block computes $C[t_y + \text{blockIdx.y} \cdot 32][t_x + \text{blockIdx.x} \cdot 32]$. Now 32 threads in a warp access 32 consecutive elements --- a single 128-byte cache line transaction instead of 32 separate ones.
+
+\textbf{Profile:} Check \texttt{l1tex\_\_t\_sectors\_pipe\_lsu\_mem\_global\_op\_ld.sum} before and after. Sector requests per warp should drop from 32 to 1.
+
+\textbf{Expected gain:} 2--5$\times$ over Kernel~1.
+
+\medskip
+\textbf{Kernel 3: Shared Memory Blocking.}
+Load tiles of $A$ and $B$ into shared memory before computing. Each element is loaded once from HBM; then \texttt{BLOCKSIZE} multiply-accumulate operations reuse it from shared memory. Arithmetic intensity improves from $O(1)$ to $O(\text{BLOCKSIZE})$.
+
+Key detail: \texttt{\_\_syncthreads()} after loading ensures all data is visible before computation begins; a second \texttt{\_\_syncthreads()} at the end of the tile loop ensures safe overwrite on the next iteration. Missing either sync is a race condition.
+
+Tile size: start with \texttt{BLOCKSIZE=32} ($32 \times 32 \times 4 = 4$~KB per tile, well within 48~KB shared memory). Try 64 (16~KB) and 128 (64~KB --- requires \texttt{cudaFuncSetAttribute} to increase shared memory allocation).
+
+\textbf{Expected gain:} 5--10$\times$ over Kernel~2 for large $N$.
+
+\medskip
+\textbf{Kernel 4: 1D Blocktiling.}
+Each thread computes \texttt{TM} consecutive output elements instead of one. The thread registers accumulate \texttt{TM} partial sums, reusing the loaded $B$ element across all accumulators. This increases arithmetic intensity per thread and reduces shared memory reads: without register caching, shared memory is read \texttt{TM}$\times$ per $k$ iteration; with caching, once.
+
+\textbf{Tune:} Try \texttt{TM} $\in \{4, 8, 16\}$. Profile register usage with \texttt{ncu --metrics sm\_\_maximum\_warps\_per\_active\_cycle\_pct}.
+
+\medskip
+\textbf{Kernel 5: 2D Blocktiling (TM$\times$TN).}
+Extend to 2D: each thread accumulates a \texttt{TM}$\times$\texttt{TN} sub-tile in registers. Cache a column of \texttt{TM} $A$ elements and a row of \texttt{TN} $B$ elements; compute the outer product to update the accumulator. This is the fundamental GEMM microkernel structure: load, outer product, accumulate.
+
+Boehm's parameters: \texttt{BM=128, BN=128, BK=8, TM=8, TN=8}. Each thread holds $8 \times 8 = 64$ FP32 accumulators plus 8 $A$ and 8 $B$ registers --- 79 registers total. H100 has 65536 registers per SM; at 79 registers/thread you can have $\lfloor 65536 / 79 \rfloor \approx 829$ threads before register-limited occupancy. Verify: \texttt{ncu --metrics launch\_\_registers\_per\_thread}.
+
+\textbf{Expected gain:} Often 2--3$\times$ over Kernel~4 --- the largest single jump in the progression.
+
+\medskip
+\textbf{Kernel 6: Vectorized Loads (float4 = 128-bit).}
+Replace scalar \texttt{float} loads with \texttt{float4} loads (4 FP32 values = 128 bits). One \texttt{float4} load issues one instruction and fills 4 registers, vs.\ 4 separate instructions. Cast pointers to \texttt{float4*} for global-to-shared-memory loads (alignment is guaranteed by \texttt{cudaMalloc}).
+
+\textbf{Profile:} \texttt{ncu --metrics l1tex\_\_t\_bytes\_pipe\_lsu\_mem\_global\_op\_ld.sum} --- bytes should be unchanged; sectors should drop $\sim 4\times$.
+
+\medskip
+\textbf{Kernel 7: Warptiling --- Block $\to$ Warp $\to$ Thread Hierarchy.}
+Add an explicit warp-level tile between block and thread. A block of 128$\times$128 output divides into warp tiles of 64$\times$64; each warp of 32 threads computes its tile. Within the warp tile, each thread computes a 16$\times$16 sub-tile using WMMA or direct MMA instructions (\texttt{mma.sync.aligned.m16n8k16} PTX or the WMMA C++ API). WMMA fragments hold $A$, $B$, and accumulator data in a warp-distributed register layout.
+
+\textbf{Boehm's result:} 93.7\% of cuBLAS on A6000. On H100, targeting $>70\%$ of cuBLAS is a realistic bar without CUTLASS internals.
+
+\textbf{Final record:} For each kernel $k \in \{0, \ldots, 7\}$, fill in: TFLOP/s, \% of cuBLAS, top Nsight bottleneck metric, one-sentence causal explanation of the gain over the previous kernel. This table is your portfolio evidence.
+\end{exercise}
+
+% -----------------------------------------------------------------------
+\subsection{Part C: Blackwell-Specific Features}
+% -----------------------------------------------------------------------
+
+\begin{exercise}{Blackwell Analysis: TMEM, FP4, Clusters (4--6 hours)}
+Part~B built your understanding of CUDA optimization on Hopper. Part~C extends to Blackwell's three new features. The first (TMEM) is a guided implementation exercise if you have B200 access. The second and third (FP4 and clusters) are design and analysis exercises that build understanding of \textit{why} these features exist and \textit{when} they help, using the roofline framework from Part~A.
+
+\medskip
+\textbf{Feature 1: TMEM Accumulator Storage.} \textit{Implementation exercise (requires B200).}
+
+Blackwell introduces Tensor Memory (TMEM), a new on-chip memory space for Tensor Core accumulators. Unlike shared memory (visible to all threads in a block), TMEM is reserved for accumulator tiles and requires explicit allocation.
+
+\textbf{Starting point:} Take Kernel~7 (warptiling with WMMA), where accumulators live in registers. Compile with \texttt{-arch=sm\_100}.
+
+\textbf{Modification:} Allocate TMEM for the accumulator via \texttt{cuda::ptx::tcgen05\_alloc(\&tmem\_ptr, \textit{num\_cols})}. TMEM is addressed as a 2D structure; each ``column'' holds a portion of the accumulator for one MMA tile. Replace WMMA accumulator fragments with TMEM-resident accumulators. After the $k$-loop, store the TMEM accumulator back to global memory via shared memory as a staging area.
+
+\textbf{Measure:} Register usage (expect a reduction), occupancy (expect an increase), and TFLOP/s. Profile with \texttt{ncu --metrics sm\_\_maximum\_warps\_per\_active\_cycle\_pct}.
+
+\textbf{Predict before measuring:} If TMEM reduces per-thread register count from 79 to 55, how does SM occupancy change? Does higher occupancy translate to higher TFLOP/s? (Hint: if the kernel is compute-bound, more warps per SM only help by hiding inter-instruction latency, not by increasing peak FLOP/s.)
+
+\textit{If B200 is not available:} Work through the prediction exercise above using published specs. The conceptual understanding of when TMEM helps (register-pressure-limited kernels) vs.\ when it is irrelevant (kernels already at full occupancy) is the valuable takeaway.
+
+\medskip
+\textbf{Feature 2: FP4 Precision.} \textit{Design and analysis exercise.}
+
+Blackwell natively supports FP4 (E2M1: 1 sign, 2 exponent, 1 mantissa bit) and FP6 (E2M3 or E3M2) in hardware Tensor Cores. For RLVR inference, FP4 weights with FP32 accumulation may offer the best throughput-per-quality tradeoff.
+
+\textbf{Work through:}
+\begin{enumerate}
+  \item \textbf{Bandwidth arithmetic:} A 7B-parameter model in FP4 is $\sim$3.5~GB vs.\ $\sim$14~GB in FP16. At batch size 1, generation is memory-bandwidth-bound. On B200 at 8~TB/s, how many tokens/second can you generate with FP4 weights vs.\ FP16, assuming the weight load is the bottleneck? (The answer should approach 4$\times$.)
+  \item \textbf{Quality cost:} FP4 has 1 mantissa bit --- it can represent at most 16 distinct values. For a weight matrix with values spanning $[-1, 1]$, what is the maximum quantization error per element with symmetric per-channel quantization? At what point does this error matter for RLVR training stability? (Think about: gradient norms spike around reward events in RL. If FP4 quantization error compounds through many layers, does this amplify gradient spikes?)
+  \item \textbf{Design the kernel (on paper):} Sketch how you would unpack two FP4 values from a packed \texttt{uint8}, load them into shared memory, and feed them to a Blackwell FP4 MMA instruction. What alignment constraints does the packed format impose? How would you handle the shared memory layout?
+\end{enumerate}
+
+\textit{If you have B200 access:} Implement the kernel. Quantize a test weight matrix from FP16 to FP4 using symmetric per-channel quantization, write the unpack-and-MMA kernel, and compare to FP16 Kernel~7. Report TFLOP/s, bandwidth utilization, and the absolute output error (FP4 vs.\ FP16 ground truth).
+
+\medskip
+\textbf{Feature 3: Thread Block Clusters.} \textit{Analysis exercise.}
+
+Blackwell allows clusters of up to 16 thread blocks that share distributed shared memory (DSMEM). A single block is limited to 228~KB shared memory; a cluster of 16 has $16 \times 228~\text{KB} = 3.6~\text{MB}$ of aggregated on-chip storage.
+
+\textbf{Work through:}
+\begin{enumerate}
+  \item \textbf{When clusters help:} A cluster reduces HBM traffic by increasing tile reuse in DSMEM. For an $N \times N$ matmul with a cluster tile of size $T$, the HBM traffic is $O(N^3 / T)$. At $T = 228~\text{KB}$ (single block) vs.\ $T = 3.6~\text{MB}$ (cluster of 16), how much does HBM traffic decrease? At what matrix size $N$ does the HBM savings exceed the cluster synchronization overhead?
+  \item \textbf{When clusters hurt:} Cluster barriers (\texttt{cluster.sync()}) are more expensive than \texttt{\_\_syncthreads()} because they synchronize across SMs, not just within one. For small $N$ where the matmul finishes quickly, barrier overhead can dominate. Estimate: if a cluster barrier costs $\sim$5$\mu$s and the inner loop runs for 100 iterations, what fraction of total kernel time is barrier overhead at $N = 512$ vs.\ $N = 8192$?
+  \item \textbf{RLVR relevance:} During autoregressive decoding (batch size 1--8), the effective matrix size is small. Are clusters useful for the RLVR generation bottleneck, or only for training-side matmuls?
+\end{enumerate}
+
+\textit{If you have B200 access:} Implement a cluster-of-16 matmul. Declare the cluster in the launch configuration (\texttt{cfg.clusterDim = \{16, 1, 1\}}), use \texttt{cluster.sync()} barriers and \texttt{cuda::cluster::load} for cross-block shared memory reads. Compare to Kernel~7 at $N \in \{512, 2048, 8192\}$ and find the crossover empirically.
+\end{exercise}
+
+% -----------------------------------------------------------------------
+\subsection{Part D: Triton Comparison}
+% -----------------------------------------------------------------------
+
+\begin{exercise}{Triton Matmul vs.\ Hand-Written CUDA (2--3 hours)}
+Write the same FP16 matmul in Triton using \texttt{tl.dot}, \texttt{tl.load}, and \texttt{tl.store}. Start from the canonical Triton matmul tutorial (docs.triton-lang.org); the exercise is in the profiling and gap analysis, not the implementation.
+
+\begin{enumerate}
+  \item Implement Triton matmul with \texttt{@triton.autotune} over \texttt{BLOCK\_M, BLOCK\_N, BLOCK\_K} $\in \{64, 128\}$ and \texttt{num\_warps} $\in \{4, 8\}$.
+  \item Benchmark at $N \in \{512, 1024, 2048, 4096, 8192\}$ and record TFLOP/s alongside your Kernel~7 result.
+  \item Profile both kernels with \texttt{ncu}. Compare: register usage, shared memory usage, warp occupancy, instruction mix (load vs.\ compute).
+\end{enumerate}
+
+\textbf{Questions to answer:}
+\begin{itemize}
+  \item At what matrix size does Triton match or exceed Kernel~7? (Expect Triton to be competitive at $N \geq 2048$ and fall behind at $N = 512$ where the autotuner has fewer layout options.)
+  \item Where does Triton fall short? Use Nsight to identify whether the gap is in: (a) suboptimal tile size from the autotuner, (b) higher register usage from compiler conservatism, (c) shared memory layout causing bank conflicts, or (d) worse warp-level instruction scheduling.
+  \item For which RLVR operations would you choose Triton in production? Which would you hand-write?
+\end{itemize}
+\end{exercise}
+
+% -----------------------------------------------------------------------
+\subsection{Part E: Flash Attention}
+% -----------------------------------------------------------------------
+
+\begin{exercise}{Flash Attention: Implementation and Analysis (3--4 hours)}
+Flash Attention is the most consequential single-kernel optimization in recent ML systems history. For RLVR training, attention over long-context rollouts (8K--32K tokens) is a significant wall-time component.
+
+\textbf{The key insight --- memory-IO analysis:}
+\begin{itemize}
+  \item \textbf{Standard attention:} Compute $S = QK^\top / \sqrt{d}$ ($O(N^2 d)$ FLOPs), write $S \in \mathbb{R}^{N \times N}$ to HBM ($O(N^2)$ bytes), apply softmax, compute $O = S V$. Total HBM traffic: $\Theta(N^2 + Nd)$ --- dominated by the $N \times N$ matrix at large $N$.
+  \item \textbf{Flash Attention:} Process $Q$, $K$, $V$ in blocks, maintaining a running softmax (the ``online softmax trick''). The $N \times N$ matrix is \textit{never materialized in HBM} --- it exists transiently in shared memory. Total HBM traffic: $\Theta(Nd)$ --- linear in sequence length.
+\end{itemize}
+
+\textbf{Online softmax trick:} Standard softmax requires two passes: find the max (for numerical stability), then compute $\exp(x_i - \max) / \sum \exp(x_j - \max)$. The online algorithm maintains running $(m, \ell)$ --- current maximum and current sum --- updating both as new elements arrive. This enables single-pass softmax over blocks that do not fit in shared memory simultaneously.
+
+\textbf{Exercise options (choose based on time):}
+\begin{enumerate}
+  \item \textbf{Study option (2 hours):} Read the Flash Attention v2 paper (Dao 2023) and the Triton implementation (\texttt{python/triton/ops/flash\_attention.py}). Trace through the forward pass, identifying: (a) which tensors live in HBM vs.\ shared memory at each step, (b) where the online softmax state is maintained, (c) how the backward pass handles recomputation instead of storing the $N \times N$ matrix.
+  \item \textbf{Implementation option (4 hours):} Implement Flash Attention forward pass in Triton. Start from \texttt{triton-lang.org/main/getting-started/tutorials/06-fused-attention.html}. Verify correctness against PyTorch reference. Benchmark throughput vs.\ sequence length $N \in \{512, 1024, 2048, 4096, 8192\}$. At what $N$ does Flash Attention outperform standard attention? (Expect crossover around $N = 512$--$1024$ on H100.)
+\end{enumerate}
+
+\textbf{Blackwell relevance:} Flash Attention's $\Theta(Nd)$ HBM traffic scales directly with bandwidth; standard attention's $\Theta(N^2)$ traffic does too. The ratio of avoided bytes is $N/d$ --- at $N=8192$ and $d=128$, Flash Attention avoids $64\times$ more HBM traffic. B200's higher bandwidth makes Flash Attention faster in absolute terms, but the \textit{relative} benefit vs.\ standard attention is unchanged. The bandwidth upgrade scales the algorithmic advantage; it does not change it.
+\end{exercise}
+
+% -----------------------------------------------------------------------
+\subsection{Part F: Blackwell Inference Analysis}
+% -----------------------------------------------------------------------
+
+\begin{exercise}{Amdahl's Law for RLVR on B200 (2--3 hours)}
+B200 marketing claims 5$\times$ inference throughput over H100. Apply Amdahl's Law to determine the realistic system speedup for RLVR training.
+
+\textbf{Setup:} RLVR training spends approximately 60\% of wall time on generation and 40\% on the training step.
+
+\textbf{Naive calculation:} If generation is 5$\times$ faster on B200:
+$$\text{Speedup}_{\text{naive}} = \frac{1}{0.40 + 0.60/5} = \frac{1}{0.52} \approx 1.92\times$$
+
+But generation is not a monolith. Break it into components:
+
+\begin{center}
+\begin{tabular}{lrrl}
+\hline
+\textbf{Component} & \textbf{Fraction of gen.} & \textbf{B200 speedup} & \textbf{Reason} \\
+\hline
+Attention (KV-cache reads) & 40\% & $\sim 2.4\times$ & Bandwidth: 8/3.35 \\
+Weight matmul (decode) & 30\% & $\sim 2.4\times$ & Bandwidth-bound \\
+Sampling / argmax & 10\% & $\sim 1.5\times$ & Partially memory-bound \\
+KV cache management & 20\% & $\sim 2.4\times$ & Bandwidth-bound \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Work out:}
+\begin{enumerate}
+  \item Compute the effective generation speedup using the Amdahl formula component by component. (Note: use the arithmetic weighted average of time reductions, not harmonic mean --- each component's speedup reduces its fraction of total time.)
+  \item Plug the resulting generation speedup into the top-level Amdahl formula. What is the realistic system speedup?
+  \item Now consider FP4 quantization: the weight matmul component (30\% of generation) may see $4\times$ speedup from 4$\times$ fewer bytes loaded. How does this change the calculation?
+  \item If B200's 5$\times$ marketing claim assumes all components improve equally, what speedup per component would produce exactly 5$\times$? Is this realistic?
+\end{enumerate}
+
+\textbf{Write a 200-word memo:} ``The B200 delivers X$\times$ realistic speedup for RLVR training, not the marketed 5$\times$, because [specific components] are [bandwidth/compute]-bound and improve only [fraction]$\times$.'' This memo --- backed by arithmetic from your kernel measurements --- is a concrete artifact demonstrating systems reasoning.
+\end{exercise}
+
+% -----------------------------------------------------------------------
+\subsection{Portfolio Project}
+% -----------------------------------------------------------------------
+
+\begin{portfolio}{CUDA/Blackwell Kernel Optimization Guide}
+\textbf{Output options:}
+\begin{itemize}
+  \item \textbf{Primary:} Blog post titled ``What Blackwell-specific optimizations (TMEM, FP4, clusters) actually matter for RLVR inference --- and which are marketing?'' Target: 3000--4000 words with profiling screenshots and the kernel progression table from Part~B.
+  \item \textbf{Alternative} (if B200 cloud is not available): Submit the Boehm progression (Kernels 0--7) plus the Part~C analysis exercises as a combined H100 kernel guide + Blackwell analysis. The H100 results are credible portfolio evidence; the Blackwell analysis can be done using published specs and the design exercises.
+\end{itemize}
+
+\textbf{The monkey:} The distinction between hardware improvements that deliver real RLVR throughput and those that are marketing. The kernel measurements are the pedestal --- they establish credibility. The monkey is the analysis: which of TMEM, FP4, and clusters gives a measurable RLVR speedup, and what fraction of the marketed 5$\times$ improvement is real at the system level?
+
+\textbf{Verification criteria:}
+\begin{itemize}
+  \item At least 70\% of cuBLAS on the warptiling kernel (Kernel~7) at $N=4096$ on H100.
+  \item Blackwell analysis (Part~C) identifies which feature helps most for RLVR generation and why, backed by roofline arithmetic or empirical measurement.
+  \item Amdahl's Law analysis (Part~F) backs the blog's central claim with numbers.
+\end{itemize}
+
+\textbf{Hardware budget:} H100 at $\sim$\$2/hr for Parts~B, D, E (estimate 15--20 hours of GPU time: $\sim$\$30--40); B200 at $\sim$\$2.25/hr for Part~C implementation (estimate 4--8 hours: $\sim$\$9--18, optional). Total: $\sim$\$40--60. Budget $\sim$\$250/month allows multiple iteration cycles.
+\end{portfolio}
+
+\newpage

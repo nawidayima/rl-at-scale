@@ -19,9 +19,9 @@
 \lstset{
   language=Python,
   basicstyle=\small\ttfamily,
-  keywordstyle=\color{blue!70!black},
-  commentstyle=\color{green!50!black},
-  stringstyle=\color{red!60!black},
+  keywordstyle=\color{codekey}\bfseries,
+  commentstyle=\color{codecomm}\itshape,
+  stringstyle=\color{codestr},
   breaklines=true,
   frame=single,
   framesep=4pt,
@@ -46,24 +46,11 @@
 \tableofcontents
 \newpage
 
-\part{Study Guide}
-
-\input{studyguide/01-research-taste}
-\input{studyguide/02-rl-foundations}
-\input{studyguide/03-scaling-and-alignment}
-\input{studyguide/04-interview-tactics}
-\input{studyguide/05-deep-dives}
-\input{studyguide/06-reference-appendix}
-
-\part{Workbook}
-
-\input{workbook/01-amd-benchmarking}
-\input{workbook/02-cuda-kernels}
-\input{workbook/03-tpu-pallas}
-\input{workbook/04-inference-serving}
-\input{workbook/05-distributed-training}
-\input{workbook/06-policy-gradients}
-\input{workbook/07-tinyrl-pipeline-scaling}
-\input{workbook/08-synthesis}
+\input{chapters/00-introduction}
+\input{chapters/01-memory-wall}
+\input{chapters/02-kernel-optimization}
+\input{chapters/03-rollout-generation}
+\input{chapters/04-policy-gradients}
+\input{chapters/05-tinyrl-pipeline}
 
 \end{document}

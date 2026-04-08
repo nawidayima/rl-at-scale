@@ -1,0 +1,155 @@
+\section{Introduction}
+
+Every wasted FLOP has a dollar cost that compounds at datacenter scale. Anthropic is scaling from 2.5~GW to over 5~GW by year-end at \$10--13B/GW/year; the Big Four hyperscalers are spending a combined \$600B in CapEx this year. The problems are coupled: generation throughput gates RL rollouts, algorithm choice determines whether those rollouts produce signal, and the unit economics---cost per useful training step, hardware utilization, the 5--6 year payback per GW deployed---determine whether a research direction is financially viable.
+
+Anthropic's RL infrastructure spans performance engineering, research engineering, and research science. Understanding across these boundaries makes you better at any one of them.
+
+This guide is organized around a single metric: \textit{intelligence per Watt}. Every chapter builds cross-boundary intuition and produces a publishable artifact.
+
+% --- Governing Equation ---
+
+\begin{tcolorbox}[colback=matcha!5!white, colframe=matcha!70!black, boxrule=0.6pt,
+  left=5pt, right=5pt, top=6pt, bottom=6pt,
+  fonttitle=\bfseries, title=The Governing Metric]
+\[
+\underbrace{\frac{\text{Intelligence}}{\text{Watt}}}_{\text{What we maximize}}
+\;=\;
+\underbrace{\left(\frac{\text{Quality}}{\text{FLOP}}\right)}_{\substack{\text{Ch\,5--6:}\\\text{RL Depth}}}
+\;\times\;
+\underbrace{\left(\frac{\text{FLOPs}}{\text{Watt}}\right)}_{\substack{\text{Ch\,1--4,\,7:}\\\text{Hardware \& Systems}}}
+\]
+\smallskip
+The ``per Watt'' is both physics and dollars. At \$10--13B per GW per year, a 10\% improvement in utilization is worth hundreds of millions.
+\end{tcolorbox}
+
+% --- Three-Tier Hierarchy ---
+
+\subsection{How the Chapters Compose}
+
+The chapters do not compose sequentially --- they compose \textit{hierarchically}. The hardware chapters set the iteration speed (experiments per week). The algorithm chapters determine what each experiment is testing. Both must be healthy for a research program to move fast.
+
+\begin{center}
+\begin{tikzpicture}[
+  tier/.style={draw, thick, rounded corners=4pt, minimum height=1.4cm, text centered, font=\small},
+  arrow/.style={-{Stealth[length=6pt]}, thick, sumi!60}
+]
+  % Tier 1 — base
+  \node[tier, fill=aiiro!8, minimum width=12cm] (t1)
+    {\textbf{Hardware \& Systems} (Ch\,1--4,\,7) --- FLOPs/Watt};
+
+  % Tier 2 — top
+  \node[tier, fill=beni!8, minimum width=8cm, above=0.6cm of t1] (t2)
+    {\textbf{RL Depth} (Ch\,5--6) --- Quality/FLOP};
+
+  % Arrows
+  \draw[arrow] (t1.north) +(-2,0) -- +(-2,0.6);
+  \draw[arrow] (t1.north) +(2,0) -- +(2,0.6);
+
+  % Label
+  \node[font=\footnotesize\itshape, sumi!70, right=0.3cm of t2] {builds on};
+\end{tikzpicture}
+\end{center}
+
+% --- PE-RL Flywheel ---
+
+\subsection{The PE--RL Flywheel}
+
+Performance engineering and reinforcement learning are not separate concerns. They form a reinforcing loop:
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=5cm,
+  box/.style={draw, thick, rounded corners=6pt, fill=#1, minimum width=3.2cm, minimum height=1.6cm, text centered, font=\small\bfseries, text width=2.8cm},
+  lbl/.style={font=\footnotesize, text width=3.2cm, align=center}
+]
+  \node[box=aiiro!10] (pe) {Performance\\Engineering};
+  \node[box=beni!10, right=of pe] (rl) {Reinforcement\\Learning};
+
+  \draw[-{Stealth[length=7pt]}, thick, bend left=25]
+    (pe.north east) to node[lbl, above] {Higher throughput\\$\rightarrow$ more rollouts/hr} (rl.north west);
+  \draw[-{Stealth[length=7pt]}, thick, bend left=25]
+    (rl.south west) to node[lbl, below] {Policy learns kernel\\configs, quantization} (pe.south east);
+\end{tikzpicture}
+\end{center}
+
+\noindent Higher generation throughput means more gradient steps per week, which means faster policy improvement --- or faster discovery that a hypothesis is wrong. Conversely, a policy trained with verifiable rewards on compiler or hardware benchmarks can learn optimization decisions that outperform human heuristics. The person who understands both sides of this loop is uniquely valuable.
+
+% --- Chapter Map ---
+
+\subsection{Chapter Map}
+
+\begin{enumerate}
+  \item \textbf{CUDA Kernel Optimization.} Foundational GPU kernel engineering on NVIDIA hardware. The prerequisite for every other hardware chapter. Produces a Boehm-style kernel progression with roofline analysis.
+
+  \item \textbf{Benchmarking AMD MI300X.} Evaluates a multi-billion dollar hardware investment: where does AMD win on intelligence-per-Watt, and what engineering investment closes the gaps? Produces a decision-grade benchmarking report.
+
+  \item \textbf{TPU/Pallas Kernel Optimization.} Google's answer to the same efficiency question. Covers Anthropic's primary accelerator fleet and contrasts with the GPU approach of Chapters~1--2.
+
+  \item \textbf{RL Inference \& Serving Efficiency.} The \#1 RLVR bottleneck: autoregressive generation consumes 50--70\% of training wall time. Hardware-agnostic techniques for the throughput problem that gates everything downstream.
+
+  \item \textbf{Policy Gradients --- Hypothesis-Driven Depth.} Which policy gradient choices --- clipping, GAE, KL penalties, entropy regularization --- are actually load-bearing, and why? Produces confirmed or refuted hypotheses with clean ablations. \textit{Prerequisites: none. Can be started in parallel with Chapter~1 at \$0 compute cost.}
+
+  \item \textbf{TinyRL --- Community OSS Framework.} Chapter~5 theory operationalized in a community-auditable framework. Every design decision has a clean ablation. Produces an open-source artifact with leaderboard entries.
+
+  \item \textbf{Distributed Training \& Communication.} The capstone: scaling everything from Chapters~1--6 across thousands of nodes. Communication overhead, parallelism strategies, and cluster utilization at 5+~GW scale.
+\end{enumerate}
+
+% --- Portfolio Comparison ---
+
+\subsection{Choosing Your Portfolio Project}
+
+\begin{table}[h]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+\textbf{Criterion} & \textbf{CUDA} & \textbf{AMD} & \textbf{Pallas} & \textbf{Infer.} & \textbf{PG} & \textbf{TinyRL} & \textbf{Distrib.} \\
+ & \textbf{(Ch\,1)} & \textbf{(Ch\,2)} & \textbf{(Ch\,3)} & \textbf{(Ch\,4)} & \textbf{(Ch\,5)} & \textbf{(Ch\,6)} & \textbf{(Ch\,7)} \\
+\midrule
+Clean feedback loop?   & Yes  & Yes   & Yes    & Yes  & Yes     & Yes  & Yes  \\
+Fast iteration?        & Yes  & Yes   & Med.   & Yes  & Yes     & Yes  & Med. \\
+Underexplored?         & Low  & V.Hi  & High   & High & ?       & High & Med. \\
+RLVR-relevant?         & Yes  & Yes   & Yes    & Very & Yes     & Very & Yes  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{By goal:}
+\begin{itemize}
+  \item \textbf{Fastest artifact (5--7 weeks):} Ch\,2 AMD benchmark. One number --- MI300X vs.\ H100 on end-to-end RLVR throughput --- starts a conversation.
+  \item \textbf{Strongest community signal:} Ch\,6 TinyRL. Open-source frameworks with leaderboard entries are persistent artifacts that compound.
+  \item \textbf{Broadest role targeting:} Ch\,1 + Ch\,3. Covers GPU and TPU kernel engineering simultaneously.
+  \item \textbf{Highest research ceiling:} Ch\,5 policy gradient hypotheses. A confirmed or refuted hypothesis about clipping behavior or GAE bias is more valuable than a benchmark table, if it changes how people train policies.
+\end{itemize}
+
+% --- Methodology ---
+
+\subsection{Methodology}
+
+Every project in this guide follows the same template:
+
+\begin{enumerate}
+  \item Pick a well-defined problem with clean verification.
+  \item Build the simplest version that could possibly produce a signal.
+  \item Ablate one variable at a time. Predict before you observe.
+  \item Document honestly --- negative results and failed hypotheses are publishable.
+\end{enumerate}
+
+% --- Box Types ---
+
+\subsection{How to Read This Guide}
+
+Chapters use three box types to distinguish different kinds of work:
+
+\begin{thinkfirst}{Example}
+\textit{Conceptual foundations.} Reason through the problem before touching code. No computer needed.
+\end{thinkfirst}
+
+\begin{exercise}{Example}
+\textit{Hands-on implementation.} Explicit deliverables and verification criteria.
+\end{exercise}
+
+\begin{portfolio}{Example}
+\textit{Publishable projects.} External verification criteria and a clear artifact (blog post, OSS repo, benchmark report).
+\end{portfolio}
