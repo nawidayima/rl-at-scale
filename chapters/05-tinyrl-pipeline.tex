@@ -1,2 +1,410 @@
 \section*{The RL Pipeline}
-% TODO: Write new chapter per spec Section 3, Chapter 5
+
+\smallskip
+
+\begin{whythis}
+You have the pieces. Chapter~1 taught you where memory bottlenecks live. Chapter~2 taught you how to diagnose and optimize kernels. Chapter~3 taught you how to build a rollout generation pipeline that saturates hardware. Chapter~4 taught you what the RL algorithm demands from those rollouts --- group size, advantages, KL constraints, collapse detection. This chapter composes everything into a single system and gives you a platform to test it.
+
+The gap between ``I understand each component'' and ``I can reason about the whole pipeline'' is where most engineering effort is wasted. Batch size in rollout generation affects advantage variance in the policy update. Quantization in the actors affects reward signal quality. The actor/learner ratio determines whether your pipeline is generation-bound or update-bound. You cannot make informed local decisions without seeing the full loop.
+\end{whythis}
+
+% =======================================================================
+\subsection*{Move 1: The Pipeline as a Single System}
+% =======================================================================
+
+The RL training loop is not a sequence of independent stages. It is a feedback loop where every stage constrains every other. This section walks through the complete data flow, then shows where the constraints bind.
+
+\begin{thinkfirst}[Draw the Loop Before Reading]
+On paper, draw the complete RL training loop from ``sample a prompt'' to ``updated weights.'' Label every data artifact that flows between stages (prompts, completions, rewards, advantages, gradients, new weights). For each artifact, write the shape: how many prompts, how many rollouts per prompt, how many tokens per rollout. Now: which stage produces the largest tensor? Which stage is the bottleneck? Check your answers against the walkthrough below.
+\end{thinkfirst}
+
+\subsubsection*{Stage 1: Prompt Sampling}
+
+Select $B$ prompts from the training distribution. The distribution matters: curriculum effects are real. Prompts that are too easy produce zero-variance advantages (all rollouts succeed, $\hat{A}_i \approx 0$, no gradient signal). Prompts that are too hard produce zero-variance advantages for the opposite reason (all rollouts fail). The informative prompts are at the policy's current capability frontier --- where some rollouts succeed and some fail.
+
+\textbf{Data artifact:} $B$ prompt strings. Typical $B$: 64--256.
+
+\subsubsection*{Stage 2: Rollout Generation}
+
+For each prompt, generate $G$ completions using the current policy $\pi_\theta$. This is Chapter~3's optimization target: maximize tokens per second per dollar under the constraints that matter for training (signal quality, not user latency).
+
+Every design decision from Chapter~3 applies here:
+\begin{itemize}
+  \item \textbf{Batch size.} Larger batches improve GPU utilization (Chapter~2's arithmetic intensity) but increase memory pressure and can delay updates.
+  \item \textbf{Quantization.} INT8 or FP8 actors generate tokens faster, but reduced precision introduces noise into the action distribution. The policy update (Stage~5) sees this noise as reward variance.
+  \item \textbf{KV-cache management.} Prompt prefixes shared across $G$ rollouts for the same prompt can share KV-cache entries (Chapter~3's prefix sharing).
+  \item \textbf{Sequence length.} Generation length caps trade off between allowing the model to reason and preventing straggler rollouts that hold up the batch.
+\end{itemize}
+
+\textbf{Data artifact:} $B \times G$ completions, each up to $L$ tokens. At $B = 128$, $G = 16$, $L = 512$: 2048 completions, $\sim$1M tokens. This is the dominant cost --- 60--80\% of wall time (Chapter~4's cost breakdown).
+
+\subsubsection*{Stage 3: Reward Computation}
+
+Score each completion. In RLVR: run the verifier (unit tests, math checker, formal proof system). In RLHF: run the reward model forward pass. The reward type determines the signal quality and the failure modes (Chapter~4's RLVR vs.\ RLHF discussion).
+
+\begin{itemize}
+  \item \textbf{Deterministic verifiers} (unit tests, exact-match) are cheap and clean but binary --- pass or fail. Partial credit requires engineering (fraction of tests passed).
+  \item \textbf{Neural reward models} are continuous-valued but gameable. The reward model is itself a bottleneck: a separate forward pass per completion through a model that may be as large as the policy.
+\end{itemize}
+
+\textbf{Data artifact:} $B \times G$ scalar rewards. The reward tensor is tiny compared to the completions, but its quality determines everything downstream.
+
+\subsubsection*{Stage 4: Advantage Estimation}
+
+Convert raw rewards to per-rollout advantages. GRPO computes group-normalized advantages within each prompt:
+\begin{align*}
+  \hat{A}_i = \frac{R_i - \bar{R}_{\text{group}}}{\sigma_{R,\text{group}} + \epsilon}
+\end{align*}
+
+This is Chapter~4's Lever~1. Key interactions:
+\begin{itemize}
+  \item \textbf{Group size $G$ controls variance.} Small $G$ gives noisy advantages. Large $G$ gives clean advantages but costs $G\times$ more generation. The optimal $G$ depends on the reward distribution, which depends on the prompt difficulty, which changes as the policy improves.
+  \item \textbf{Batch normalization scope.} Normalizing across the entire batch vs.\ per-prompt changes gradient direction. Per-prompt normalization (GRPO default) ensures every prompt contributes signal regardless of absolute reward magnitude.
+  \item \textbf{Dead rollouts.} If all $G$ rollouts for a prompt get the same reward, $\sigma_{R} = 0$ and advantages are undefined. These prompts contribute no gradient. The fraction of dead-rollout prompts is a direct measure of wasted compute.
+\end{itemize}
+
+\textbf{Data artifact:} $B \times G$ scalar advantages, mean $\approx 0$, std $\approx 1$ per prompt group.
+
+\subsubsection*{Stage 5: Policy Update}
+
+Compute the clipped policy gradient and update weights. This is Chapter~4's clipping, KL penalty, and entropy bonus:
+\begin{align*}
+  \mathcal{L}_{\text{clip}} = -\mathbb{E}\left[\min\left(r_t(\theta)\hat{A}_t,\; \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon)\hat{A}_t\right)\right] + \beta \cdot D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}})
+\end{align*}
+
+The backward pass is fast relative to generation (5--15\% of wall time). But the update determines how much the policy changes, which determines how stale the actors' weights become, which determines how many useful rollouts the next batch produces.
+
+\textbf{Key interaction: staleness.} If actors use weight version $\theta_t$ but the learner has already updated to $\theta_{t+k}$, the rollouts are off-policy by $k$ steps. The importance sampling ratio $r_t(\theta) = \pi_{\theta_{t+k}}(\tau) / \pi_{\theta_t}(\tau)$ deviates from 1, and clipping activates more aggressively. In the limit, all rollouts are clipped to zero effective gradient. This is why actor/learner pipelining (Chapter~3) must be co-designed with the clipping threshold (Chapter~4).
+
+\textbf{Data artifact:} Updated weight tensor $\theta_{t+1}$. Size: the full model. At 1B parameters in FP16: 2~GB that must be broadcast to all actors.
+
+\subsubsection*{Stage 6: Weight Sync and Repeat}
+
+Broadcast $\theta_{t+1}$ to all actors. The sync latency determines the minimum staleness of the next batch. With $N$ actor nodes:
+\begin{itemize}
+  \item \textbf{Synchronous sync:} All actors wait for the new weights. Zero staleness, but the pipeline stalls during broadcast. Wall time = generation + update + sync.
+  \item \textbf{Asynchronous sync:} Actors continue generating with old weights while the learner updates. Higher utilization, but staleness accumulates. The clipping threshold $\epsilon$ implicitly bounds how much staleness is tolerable.
+\end{itemize}
+
+The new policy generates new rollouts. The loop repeats.
+
+% --- The capstone TikZ diagram ---
+
+\bigskip
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=1.2cm and 2.0cm,
+  stage/.style={draw, rounded corners=4pt, minimum height=1.0cm, minimum width=3.2cm,
+                text centered, font=\small\bfseries, line width=0.7pt},
+  annot/.style={font=\scriptsize\itshape, text width=3.4cm, align=center},
+  arr/.style={-{Stealth[length=5pt]}, thick, sumi},
+  data/.style={font=\scriptsize\ttfamily, sumi!70},
+]
+
+  % Nodes
+  \node[stage, fill=sumi!8, draw=sumi]
+    (prompt) {Prompt Buffer};
+
+  \node[stage, fill=kitsune!12, draw=kitsune, right=2.2cm of prompt]
+    (actor) {Actor Nodes};
+
+  \node[stage, fill=matcha!12, draw=matcha!80!black, right=2.2cm of actor]
+    (reward) {Reward Computation};
+
+  \node[stage, fill=matcha!8, draw=matcha!60!black, below=1.4cm of reward]
+    (adv) {Advantage Estimation};
+
+  \node[stage, fill=aiiro!12, draw=aiiro, below=1.4cm of adv]
+    (learner) {Learner Node};
+
+  % Arrows with data labels
+  \draw[arr] (prompt) -- (actor)
+    node[midway, above, data] {$B$ prompts};
+  \draw[arr] (actor) -- (reward)
+    node[midway, above, data] {$B \!\times\! G$ rollouts};
+  \draw[arr] (reward) -- (adv)
+    node[midway, right, data] {$B \!\times\! G$ rewards};
+  \draw[arr] (adv) -- (learner)
+    node[midway, right, data] {$B \!\times\! G$ advantages};
+
+  % Feedback loop: learner back to actors
+  \draw[arr, aiiro] (learner.west) -- +(-1.5, 0) |- (actor.south west)
+    node[pos=0.25, left, data, text width=1.8cm, align=right] {weight sync\\$\theta_{t+1}$};
+
+  % Chapter annotations
+  \node[annot, kitsune!80!black, above=0.1cm of actor]
+    {Ch\,2 kernels\\Ch\,3 batching, scheduling};
+  \node[annot, matcha!70!black, above=0.1cm of reward]
+    {Ch\,4 RLVR vs.\\reward model};
+  \node[annot, matcha!60!black, left=0.3cm of adv, text width=2.8cm]
+    {Ch\,4 GAE,\\normalization};
+  \node[annot, aiiro!80!black, left=0.3cm of learner, text width=2.8cm]
+    {Ch\,4 clipping, KL\\Ch\,3 actor-learner\\pipelining};
+
+\end{tikzpicture}
+\end{center}
+
+\smallskip
+\begin{center}
+\textit{\small The complete RL training loop as data flow. Each stage is annotated with the chapter whose optimizations apply. The feedback arrow from learner to actors closes the loop: the new policy generates new rollouts, and the cycle repeats.}
+\end{center}
+
+\bigskip
+
+\subsubsection*{Where the Constraints Bind}
+
+The stages are not independent knobs. Here are the interactions that catch people:
+
+\begin{enumerate}
+  \item \textbf{Batch size $\times$ advantage variance.} Larger batches in Stage~2 reduce advantage noise in Stage~4 (more samples → lower variance of the group mean). But larger batches mean longer generation time per step, which means the policy changes more between batches, which means the rollouts in Stage~2 are more stale relative to the learner in Stage~5. You cannot optimize batch size without reasoning about both effects simultaneously.
+
+  \item \textbf{Actor quantization $\times$ reward signal quality.} FP8 actors (Stage~2) generate tokens 1.5--2$\times$ faster than FP16 actors, but the action distribution is noisier. This noise propagates through Stage~3 (the reward reflects the noisy actions, not the FP16-equivalent actions) and Stage~4 (advantage estimates are computed over noisier rewards). The reward signal-to-noise ratio determines whether the throughput gain is worth the signal degradation.
+
+  \item \textbf{Actor/learner ratio $\times$ staleness.} More actors relative to learners means higher aggregate throughput in Stage~2 but longer intervals between weight syncs in Stage~6. If you have 8 actor nodes generating rollouts while 1 learner node computes updates, the learner processes one batch while actors generate the next. But if actor throughput exceeds learner throughput, rollouts queue up, and by the time the learner processes them the weights have moved. The clipping threshold $\epsilon$ (Stage~5) implicitly caps the tolerable staleness.
+
+  \item \textbf{Reward cost $\times$ pipeline balance.} Neural reward models in Stage~3 require a separate forward pass that may rival the generation cost. If reward computation is slow, the pipeline stalls between Stages~2 and~4 --- generation hardware idles while rewards are computed. Verifiable rewards (unit tests, math checkers) are nearly free, which is one reason RLVR pipelines achieve higher hardware utilization than RLHF pipelines.
+\end{enumerate}
+
+\begin{exercise}[Pipeline Bottleneck Analysis]
+You have the following configuration:
+\begin{itemize}
+  \item 4 actor nodes (FP8, 50k tokens/sec each)
+  \item 1 learner node (FP16, processes 200k-token batches)
+  \item $B = 128$ prompts, $G = 16$ rollouts/prompt, avg completion length $L = 256$ tokens
+  \item Reward: unit tests, negligible cost
+  \item Learner update: 8 seconds per batch
+  \item Weight sync: 2 seconds
+\end{itemize}
+
+\textbf{(a)} Calculate: total tokens per batch, generation time, total step time. Is this pipeline generation-bound or update-bound?
+
+\textbf{(b)} You can either add 2 more actor nodes or switch actors to FP16 (25k tokens/sec but cleaner signal). Which do you choose, and what additional information would you need to decide?
+
+\textbf{(c)} Your team proposes doubling $G$ to 32 for better advantages. What happens to generation time? To dead-rollout rate? Is this worth it?
+\end{exercise}
+
+% =======================================================================
+\subsection*{Move 2: TinyRL as the Experimental Platform}
+% =======================================================================
+
+Understanding the pipeline diagram is necessary. Testing your understanding is what makes it stick. TinyRL is the platform for that testing --- small enough to iterate in minutes, rich enough to exhibit the phenomena that matter at scale.
+
+\subsubsection*{Design Principles}
+
+The TinyStories paper (arXiv:2305.07759) showed that language model phenomena --- memorization, generalization, induction heads, grokking --- are observable at toy scale \textit{if the environment is designed carefully}. Four properties made it work:
+
+\begin{enumerate}
+  \item \textbf{Controlled data distribution.} The input distribution is known and manipulable, not scraped from the internet.
+  \item \textbf{Tasks learnable by small models.} GPT-2 scale ($<$350M parameters, often $<$10M) is sufficient to exhibit the phenomena of interest.
+  \item \textbf{Clean evaluation.} No ambiguity about what ``good'' means. Deterministic verification where possible.
+  \item \textbf{Phenomena observable at small scale.} The dynamics you care about --- reward hacking, entropy collapse, KL growth --- are visible without scaling to billions of parameters.
+\end{enumerate}
+
+TinyRL maps each of these to the RL pipeline:
+
+\begin{enumerate}
+  \item \textbf{Curated prompt sets.} 50--100 tasks per environment, sampled reproducibly. The training distribution is known.
+  \item \textbf{GPT-2 scale models.} $<$10M parameters. Train on a single GPU in under an hour. Cheap enough to ablate every hyperparameter.
+  \item \textbf{Deterministic verification.} Unit tests pass or fail. Sentiment scores are computed by a fixed classifier. Inference cost is measurable. No human raters.
+  \item \textbf{RLVR phenomena in minutes.} Reward hacking, entropy collapse, emergent strategies, KL divergence growth --- all observable before lunch.
+\end{enumerate}
+
+The reframing from Chapters~1--4: TinyRL is not a standalone framework. It is the \textit{experimental platform for testing the decisions from the previous four chapters.} When you change the batch size, quantization strategy, group size, or KL penalty, you run the experiment on TinyRL and measure whether policy improvement per compute dollar went up or down.
+
+\begin{thinkfirst}[What Makes a Good Minimal RL Environment?]
+Before reading the environment descriptions below, design the simplest RLVR environment you can imagine that still exhibits \textit{verification hacking}. Specify: the model size, the task format, the verifier, and the exploit you predict the model will find. How would you know the model is gaming the verifier rather than solving the task? Write this down before continuing.
+\end{thinkfirst}
+
+% --- TinyRL-Code ---
+
+\subsubsection*{TinyRL-Code: ``The MNIST of RLVR''}
+
+The headline environment. RLVR is the frontier paradigm. Code verification is the core RLVR domain at every major lab. If you build one environment, build this one.
+
+\textbf{Setup:}
+\begin{itemize}
+  \item \textbf{Model:} GPT-2 scale ($<$10M parameters), trained from a pretrained checkpoint.
+  \item \textbf{Task bank:} 50--100 curated programming puzzles, graded by difficulty:
+    \begin{itemize}
+      \item \textit{Easy} --- implement a single function, verified by 1--3 unit tests (e.g., \texttt{reverse\_string}, \texttt{sum\_list}).
+      \item \textit{Medium} --- implement 2 cooperating functions, verified by 5 unit tests (e.g., a parser and a formatter).
+      \item \textit{Hard} --- implement an algorithm with edge cases, verified by 10 unit tests (e.g., BFS on an adjacency list, handling empty graph and disconnected nodes).
+    \end{itemize}
+  \item \textbf{Reward:} Fraction of unit tests passed. All pass: $r = 1.0$. None pass: $r = 0.0$. Partial credit for intermediate passes.
+\end{itemize}
+
+\textbf{This is RLVR in miniature.} The verifier is objective, rule-based, and in principle non-gameable. In practice, models find exploits:
+
+\begin{itemize}
+  \item \textbf{Hardcoded outputs.} The model memorizes test inputs from repeated exposure and returns hardcoded outputs that pass the tests without implementing the function. \textit{Detection:} held-out test inputs with different values.
+  \item \textbf{Format gaming.} The model wraps a trivially wrong answer in \texttt{try/except} blocks to avoid exceptions, earning partial credit without solving the task. \textit{Detection:} reward on held-out tests drops while training reward rises.
+  \item \textbf{Specification ambiguity.} The model exploits underspecified edge cases in the problem statement that the test suite does not cover. \textit{Detection:} human review of high-reward completions that look suspicious.
+\end{itemize}
+
+These are the same exploit classes that frontier RLVR teams encounter at scale. TinyRL-Code makes them visible, characterizable, and patchable at toy scale.
+
+\textbf{The Reward Hacking Gallery.} Every exploit discovered during training is documented: the completion, the step count at which it emerged, the test suite it gamed, and the fix. This gallery is the most pedagogically valuable artifact TinyRL produces. Every hardcoded output, every format hack, every specification exploit is a concrete instance of Goodhart's Law under verifiable rewards.
+
+\textbf{Pipeline testing:} TinyRL-Code is the environment where batch size, group size, and clipping threshold decisions from Chapters~3--4 matter most. Binary rewards (pass/fail per test) create high-variance advantages. The optimal $G$ to get clean gradient signal depends on puzzle difficulty. This is where you test whether your pipeline configuration produces capability improvements efficiently.
+
+% --- TinyRL-Align ---
+
+\subsubsection*{TinyRL-Align: ``The RLHF Baseline''}
+
+\textbf{Setup:}
+\begin{itemize}
+  \item \textbf{Model:} GPT-2 scale ($<$10M parameters), pretrained on text.
+  \item \textbf{Prompts:} IMDB movie review prefixes. The model completes the review.
+  \item \textbf{Reward:} A pretrained sentiment classifier scores each completion. Positive sentiment = high reward.
+\end{itemize}
+
+The reward is a neural network, not a deterministic verifier. It can be gamed. The policy does not need to write a genuinely positive review --- it needs to write text that the classifier scores highly. These are not the same thing.
+
+\textbf{RLHF dynamics exhibited:}
+\begin{itemize}
+  \item \textbf{KL divergence growth.} The policy drifts from the reference model rapidly when the KL penalty is weak. Observable within 200 steps.
+  \item \textbf{Mode collapse.} The policy converges to a narrow distribution of high-reward outputs (verbose, exclamation-heavy text). Entropy collapses.
+  \item \textbf{Reward hacking.} Completions scoring near 1.0 from the classifier are often incoherent or nonsensical to a human reader. The gap between proxy reward and true quality is the core RLHF problem.
+  \item \textbf{Entropy collapse.} Policy entropy drops steeply as the model converges to its mode-collapsed distribution.
+\end{itemize}
+
+All dynamics visible in under 30 minutes on a single GPU.
+
+\textbf{Pipeline testing:} TinyRL-Align is where the KL penalty coefficient $\beta$ (Chapter~4, Lever~2) and collapse detection (Chapter~4, Lever~4) matter most. The neural reward provides continuous signal, so advantage estimation is smoother than TinyRL-Code --- but the signal is gameable. The contrast with TinyRL-Code shows concretely why the field moved from neural proxy rewards to verifiable rewards, and at what cost.
+
+% --- TinyRL-Quant ---
+
+\subsubsection*{TinyRL-Quant: ``The PE-RL Flywheel''}
+
+\textbf{Setup:}
+\begin{itemize}
+  \item \textbf{Model:} GPT-2 scale ($<$10M parameters), with per-layer precision as a controllable parameter.
+  \item \textbf{Action space:} Choose one of \{FP32, FP16, BF16, FP8, INT8, INT4\} for each transformer layer. The policy maps layer index and layer statistics to a precision choice.
+  \item \textbf{Reward:} $r = \text{accuracy} \times (1 / \text{avg\_bits})$, where accuracy is evaluation quality on a held-out set and avg\_bits is the mean bits per weight across layers.
+\end{itemize}
+
+The reward is fully verifiable: accuracy is computed on a fixed evaluation set, and average bits per weight is a deterministic function of the chosen precisions. No neural proxy. But the reward combines two objectives, introducing reward design sensitivity that pure unit-test verification avoids.
+
+\textbf{Dynamics exhibited:}
+\begin{itemize}
+  \item \textbf{Reward design sensitivity.} The weighting between accuracy and efficiency dramatically changes which layers the policy assigns high precision. Changing the reward formula changes the learned policy.
+  \item \textbf{Exploration in discrete spaces.} The precision action space is combinatorial ($6^{12}$ for a 12-layer model). Pure exploitation fails; entropy regularization matters.
+  \item \textbf{Eval-set gaming.} If the same evaluation set is used for reward and final assessment, the policy overfits to it. A held-out test set distinct from the reward set is essential.
+\end{itemize}
+
+\textbf{Pipeline testing:} TinyRL-Quant is Chapter~2's quantization tension made concrete. The RL agent \textit{learns to quantize its own layers}. The optimal quantization policy depends on what the model has learned --- RLVR-trained models may concentrate representations differently than SFT-only models, making the optimal per-layer precision assignment differ. This is a testable PE/RL intersection question: run TinyRL-Quant on the same architecture after SFT-only vs.\ after RLVR training, and compare which layers get high precision.
+
+% --- Verification spectrum diagram ---
+
+\medskip
+
+\begin{center}
+\begin{tikzpicture}[x=1cm, y=0.5cm]
+  % Spectrum bar
+  \shade[left color=matcha!30, right color=beni!30, rounded corners=3pt]
+    (0,0) rectangle (12,0.6);
+
+  % Labels
+  \node[font=\footnotesize\bfseries, above] at (1.5, 0.7)  {TinyRL-Code};
+  \node[font=\footnotesize\bfseries, above] at (6, 0.7)    {TinyRL-Quant};
+  \node[font=\footnotesize\bfseries, above] at (10.5, 0.7) {TinyRL-Align};
+
+  % Markers
+  \foreach \x in {1.5, 6, 10.5}
+    \fill[sumi] (\x, 0.3) circle (3pt);
+
+  % Annotations below
+  \node[font=\scriptsize\itshape, below, text width=2.5cm, align=center] at (1.5, -0.1)
+    {unit tests\\(deterministic)};
+  \node[font=\scriptsize\itshape, below, text width=2.5cm, align=center] at (6, -0.1)
+    {composite score\\(verifiable)};
+  \node[font=\scriptsize\itshape, below, text width=2.5cm, align=center] at (10.5, -0.1)
+    {neural proxy\\(gameable)};
+
+  % Axis labels
+  \node[font=\scriptsize, matcha!50!black] at (0, -1.0) {cleanest};
+  \node[font=\scriptsize, beni!50!black] at (12, -1.0) {noisiest};
+\end{tikzpicture}
+\end{center}
+
+\smallskip
+\begin{center}
+\textit{\small The verification spectrum. Moving right: reward signal gets noisier, reward hacking shifts from verifier gaming to proxy gaming, and KL regularization becomes more critical.}
+\end{center}
+
+\begin{thinkfirst}[Verification Quality and KL Penalty]
+Rank the three TinyRL environments by verification cleanliness: TinyRL-Code $>$ TinyRL-Quant $>$ TinyRL-Align. For each, identify the dominant failure mode: verification hacking, KL collapse, or mode collapse. At what point on this spectrum does verification hacking become the dominant failure mode, displacing KL collapse as the primary concern? What does this imply about how verification quality should change your choice of $\beta$?
+\end{thinkfirst}
+
+% =======================================================================
+\subsection*{Move 3: The Capstone Exercise}
+% =======================================================================
+
+This is the portfolio artifact that composes everything in this book.
+
+\begin{portfolio}[End-to-End RL Pipeline Optimization]
+Given a baseline TinyRL-Code configuration and a fixed compute budget:
+
+\begin{enumerate}
+  \item \textbf{Profile the baseline.} Where is wall time spent? Measure generation, reward, advantage computation, backward pass, weight sync. Produce a cost breakdown like Chapter~4's stacked bar. Which stage dominates?
+
+  \item \textbf{Identify the bottleneck.} Use Chapter~1 reasoning (memory-bound vs.\ compute-bound?) and Chapter~2 reasoning (roofline position, arithmetic intensity) to diagnose \textit{why} the bottleneck stage is slow.
+
+  \item \textbf{Hypothesize an intervention.} Choose one lever from Chapters~3--4: batch size, quantization, group size $G$, KL penalty $\beta$, clipping threshold $\epsilon$, actor/learner ratio. State which stage it targets and what tradeoff it introduces.
+
+  \item \textbf{Predict before running.} Write down: ``I expect this intervention to change wall time by $X$\%, reward improvement rate by $Y$\%, and the dominant bottleneck will shift from Stage $A$ to Stage $B$.'' Quantify. Commit to numbers.
+
+  \item \textbf{Run at smallest informative scale.} Use TinyRL-Code with the minimum batch size and step count that distinguishes signal from noise. A 50-step run may suffice to measure throughput changes; a 200-step run to measure reward trajectory changes.
+
+  \item \textbf{Measure: did policy improvement per dollar go up or down?} The metric is not reward alone and not throughput alone. It is reward improvement per unit of compute. A $2\times$ throughput gain that halves reward signal quality is a net loss.
+
+  \item \textbf{Iterate: what is the next bottleneck?} After your intervention, the bottleneck shifts. Re-profile. The cycle continues.
+\end{enumerate}
+
+\textbf{Deliverable:} A documented optimization case study showing the complete reasoning chain: profile $\to$ diagnosis $\to$ hypothesis $\to$ prediction $\to$ experiment $\to$ comparison with prediction $\to$ next iteration. Include at least two full iterations. Format as a publishable blog post or technical report.
+
+\textbf{Verification criteria:}
+\begin{itemize}
+  \item Predictions are written down \textit{before} experiments are run, and the document shows where predictions matched and where they diverged.
+  \item At least one intervention improves policy improvement per compute dollar.
+  \item At least one intervention makes things worse, and the analysis explains why.
+  \item The bottleneck shifts at least once across the two iterations.
+\end{itemize}
+\end{portfolio}
+
+\begin{taste}
+The difference between a good engineer and a great one is the ability to predict which intervention will have the largest effect \textit{before} running the experiment. This exercise tests that skill directly. Anyone can try things and report numbers. The value is in the reasoning chain: why you chose this intervention, what you expected, and what you learned when reality disagreed. That reasoning chain --- not the final numbers --- is what makes this a portfolio piece.
+\end{taste}
+
+% --- Additional exercises ---
+
+\begin{exercise}[Train Across All Three Environments]
+For each of TinyRL-Code, TinyRL-Align, and TinyRL-Quant: train with the same algorithm and hyperparameters for 500 steps. For each run, plot reward curve, KL divergence from reference, and policy entropy on the same figure.
+
+Answer: (1)~What is the primary pathology in each environment? (2)~Which environment shows reward hacking first? (3)~In TinyRL-Code, what is the first exploit the model finds? (4)~In TinyRL-Align, at what step does entropy begin to collapse?
+
+Write a one-paragraph characterization of how the verifier type shapes the failure mode. This is the core RLHF-vs-RLVR lesson in one experiment.
+\end{exercise}
+
+\begin{exercise}[The KL Removal Experiment]
+Train each environment for 500 steps with $\beta = 0$ (no KL penalty). State a hypothesis before running.
+
+\textbf{Key question:} Does TinyRL-Code (deterministic verifier) tolerate KL removal better than TinyRL-Align (neural reward)? If RLVR tolerates it better: explain why deterministic verification provides an implicit regularizer that neural rewards do not. If it does not: explain what that tells you about the role of KL in preventing reward hacking versus preventing distribution collapse.
+
+Document: at what KL value does each environment's policy produce visibly degenerate outputs? Check qualitative samples at step 500.
+\end{exercise}
+
+\begin{exercise}[Sweep Group Size Under Fixed Compute]
+Fix total compute (tokens generated per experiment). Sweep $G \in \{4, 8, 16, 32\}$ on TinyRL-Code. As $G$ increases, the number of prompts per batch must decrease to hold total tokens constant.
+
+Measure: (1)~final solve rate, (2)~advantage variance per prompt, (3)~fraction of dead-rollout prompts. Is there an optimal $G$ under fixed compute, or is bigger always better? What does this tell you about the interaction between Stages~2 and~4 in the pipeline?
+\end{exercise}
+
+% --- Does NOT cover ---
+
+\bigskip
+
+\textbf{What this chapter does not cover:} production-grade framework engineering (TinyRL is a learning platform, not a deployment system), scaling to thousands of nodes (the principles transfer; the systems engineering does not fit in a chapter), and novel RL algorithms (the pipeline is algorithm-agnostic --- swap GRPO for PPO or REINFORCE and the six-stage structure is unchanged). The goal is to make you dangerous with the complete loop at small scale, not to make you an expert in any single stage. The expertise is in the previous four chapters. The integration is here.
+
+\newpage
