@@ -12,7 +12,7 @@
 
 Frontier AI labs are valued at hundreds of billions of dollars on the premise that they will achieve AGI. These valuations are sustained by related-party investment cycles -- GPU suppliers, cloud providers, and strategic partners funding each other. This is not a stable equilibrium. When capital markets tighten, the labs that survive are the ones whose unit economics justify their existence independently.
 
-Responsible AGI development requires fiscal sustainability. The single largest variable cost is inference compute. Optimizing it is not an engineering problem. It is a survival problem.
+Responsible AGI development requires fiscal sustainability. The single largest variable cost is inference compute. Optimizing it is more than an engineering problem. It is a survival problem.
 
 ### Why RL Specifically
 
@@ -48,7 +48,7 @@ Research taste is driven by time and dollar constraints. The reader learns to:
 - **Recognize when small scale is NOT informative** for a specific question, and know what the smallest informative scale actually is.
 - **Design experiments that distinguish "promising, worth scaling up" from "dead on arrival"** before committing large compute budgets.
 
-The book does not prescribe a compute budget. Different readers have different ceilings (frontier lab employees, PhD students with modest stipends, self-funded individuals). The skill is finding the smallest informative scale for your specific question -- that skill is the same regardless of budget.
+The book does not prescribe a compute budget. Different readers have different ceilings (frontier lab employees, students with modest stipends, self-funded individuals). The skill is finding the smallest informative scale for your specific question -- that skill is the same regardless of budget.
 
 ### Multidisciplinary Convergence
 
@@ -75,7 +75,7 @@ Technology-specific examples are instances of these patterns, not the subject ma
 - Active hands-on problem solving -- not rote learning or tutorials
 - Every chapter produces a portfolio-worthy artifact demonstrating the thinking pattern, not just the technical outcome
 - TikZ visuals and diagrams only where they reduce cognitive load -- spatial relationships, temporal sequences, architecture comparisons. Never as decoration.
-- Writing follows crispy-rewrite principles: no filler, quantify or cut, direct and assertive tone
+- Writing follows crispy-rewrite principles: no filler, quantify or cut, direct tone. Ideas chronologically presented top - down from most important idea upfront, via Mutually Exclusive, Collectively Exhaustive Layers before drilling down into details.
 
 ---
 
@@ -277,3 +277,5 @@ These concepts appear across multiple chapters rather than occupying their own:
 6. **Single-reader framing.** No "PE wants X, RE wants Y." The reader is responsible for balancing systems throughput against algorithmic signal quality. Every tension is presented as a tradeoff the reader must reason about from both sides.
 
 7. **TinyStories principle for experimental design.** The book does not prescribe compute budgets. It teaches the reader to find the smallest scale where their specific question is informative -- preserving the phenomenon under study while stripping away confounding complexity.
+
+8. **Hybrid write strategy.** Write new chapter shells from scratch with the new framing, then mine old chapters for transplantable technical content (specific paragraphs, exercises, examples). The reorganization is structural (vendor-organized -> bottleneck-organized), so editing old chapters in place would leave residual framing. Exception: Ch 4 (Policy Gradients) can be modified from old Ch 05 directly since its scope barely changed. Old chapters remain in git history -- nothing is lost.
