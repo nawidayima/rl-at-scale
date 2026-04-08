@@ -397,11 +397,11 @@ How sensitive is $A^*$ to the staleness threshold? What happens when generation 
 What fraction of RLVR training compute is wasted on generation overhead, and which optimization provides the largest improvement per engineering hour?
 
 \medskip
-\textbf{The monkey.}
-Profile a real RLVR training loop, identify the largest throughput bottleneck in rollout generation, and implement one optimization that measurably improves tokens-per-second-per-dollar.
+\textbf{The riskiest assumption.}
+That you can identify and eliminate the dominant generation bottleneck without a full-scale training run. Profile a real RLVR training loop, identify the largest throughput bottleneck in rollout generation, and implement one optimization that measurably improves tokens-per-second-per-dollar.
 
 \medskip
-\textbf{The pedestal.}
+\textbf{The minimal viable setup.}
 A profiling harness that instruments a GRPO training loop (minimum 1B-parameter policy, real reward signal) and produces per-step breakdowns of: prefill time, decode time, KV-cache overhead, synchronization wait time (straggler bubble), weight transfer time, and training time.
 
 \medskip
