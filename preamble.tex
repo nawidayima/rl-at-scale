@@ -34,7 +34,8 @@
   colback=kitsune!5!white, colframe=kitsune!80!black, boxrule=0.6pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
   fonttitle=\bfseries\small, title=Exercise: #1,
-  breakable
+  breakable,
+  phantom={\addcontentsline{toc}{subsection}{\texorpdfstring{\textit{Exercise: #1}}{Exercise: #1}}}
 }
 
 % Think-first box (Ai-iro — winter depth)
@@ -42,7 +43,8 @@
   colback=aiiro!5!white, colframe=aiiro!70!black, boxrule=0.5pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
   fonttitle=\bfseries\small, title={Think First (no computer): #1},
-  breakable
+  breakable,
+  phantom={\addcontentsline{toc}{subsection}{\texorpdfstring{\textit{Think First: #1}}{Think First: #1}}}
 }
 
 % Portfolio project box (Beni — summer culmination)
@@ -50,7 +52,8 @@
   colback=beni!5!white, colframe=beni!80!black, boxrule=0.6pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
   fonttitle=\bfseries\small, title={Portfolio Project: #1},
-  breakable
+  breakable,
+  phantom={\addcontentsline{toc}{subsection}{\texorpdfstring{\textbf{Portfolio: #1}}{Portfolio: #1}}}
 }
 
 % Why this matters box (Matcha — spring relevance)
