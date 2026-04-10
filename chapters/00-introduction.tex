@@ -25,10 +25,10 @@ Every chapter in this book is evaluated against this metric. A kernel optimizati
 
 \subsection*{Principles}
 
-This book rests on four commitments about how to do good work in this field. They shape every chapter, exercise, and design decision that follows.
+The following four tenets establish how each problem in this book should be approached.
 
 \paragraph{Follow the problem, not the silo.}
-The hardest problems in this field cross the boundary between systems engineering and ML research. A slow training run might be a memory-bandwidth bottleneck or a policy gradient variance problem, and you cannot diagnose it from only one side. This book treats both as one discipline, because at the frontier, they are. It asks the same of you: a multi-disciplinary mindset over a specialized title.
+The hardest problems in this field cross the boundary between  engineering, ML research, economics, risk and ethics. Readers should care deeply about solving important problems over a specialized title. This is a mindset shift that embraces multi-disciplinary thinking.
 
 \paragraph{Prioritize ruthlessly and test cheaply.}
 Before building infrastructure around an idea, find the riskiest assumption, the one whose failure would make the rest irrelevant, and test it at the smallest informative scale. A 1M-parameter model on a single GPU can hit the same memory wall as a 70B model on a cluster, provided the experiment isolates that specific effect.
