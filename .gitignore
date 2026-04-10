@@ -5,7 +5,10 @@ build/
 *.log
 *.out
 *.toc
-*.pdf
 *.fls
 *.fdb_latexmk
 _ch_tmp.tex
+
+# Ignore PDFs everywhere except the pdf/ publish directory
+*.pdf
+!pdf/*.pdf

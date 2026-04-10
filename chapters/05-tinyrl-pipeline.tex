@@ -1,10 +1,11 @@
+% !TEX root = ../textbook.tex
 \section*{The RL Pipeline}
 \addcontentsline{toc}{section}{5\quad The RL Pipeline}
 
 \smallskip
 
 \begin{whythis}
-You have the pieces. Chapter~1 taught you where memory bottlenecks live. Chapter~2 taught you how to diagnose and optimize kernels. Chapter~3 taught you how to build a rollout generation pipeline that saturates hardware. Chapter~4 taught you what the RL algorithm demands from those rollouts --- group size, advantages, KL constraints, collapse detection. This chapter composes everything into a single system and gives you a platform to test it.
+You have the pieces. Chapter~1 taught you where memory bottlenecks live. Chapter~2 taught you how to diagnose and optimize kernels. Chapter~3 taught you how to build a rollout generation pipeline that saturates hardware. Chapter~4 taught you what the RL algorithm demands from those rollouts: group size, advantages, KL constraints, collapse detection. This chapter composes everything into a single system and gives you a platform to test it.
 
 The gap between ``I understand each component'' and ``I can reason about the whole pipeline'' is where most engineering effort is wasted. Batch size in rollout generation affects advantage variance in the policy update. Quantization in the actors affects reward signal quality. The actor/learner ratio determines whether your pipeline is generation-bound or update-bound. You cannot make informed local decisions without seeing the full loop.
 \end{whythis}
@@ -21,7 +22,7 @@ On paper, draw the complete RL training loop from ``sample a prompt'' to ``updat
 
 \subsubsection*{Stage 1: Prompt Sampling}
 
-Select $B$ prompts from the training distribution. The distribution matters: curriculum effects are real. Prompts that are too easy produce zero-variance advantages (all rollouts succeed, $\hat{A}_i \approx 0$, no gradient signal). Prompts that are too hard produce zero-variance advantages for the opposite reason (all rollouts fail). The informative prompts are at the policy's current capability frontier --- where some rollouts succeed and some fail.
+Select $B$ prompts from the training distribution. The distribution matters: curriculum effects are real. Prompts that are too easy produce zero-variance advantages (all rollouts succeed, $\hat{A}_i \approx 0$, no gradient signal). Prompts that are too hard produce zero-variance advantages for the opposite reason (all rollouts fail). The informative prompts are at the policy's current capability frontier, where some rollouts succeed and some fail.
 
 \textbf{Data artifact:} $B$ prompt strings. Typical $B$: 64--256.
 
@@ -37,14 +38,14 @@ Every design decision from Chapter~3 applies here:
   \item \textbf{Sequence length.} Generation length caps trade off between allowing the model to reason and preventing straggler rollouts that hold up the batch.
 \end{itemize}
 
-\textbf{Data artifact:} $B \times G$ completions, each up to $L$ tokens. At $B = 128$, $G = 16$, $L = 512$: 2048 completions, $\sim$1M tokens. This is the dominant cost --- 60--80\% of wall time (Chapter~4's cost breakdown).
+\textbf{Data artifact:} $B \times G$ completions, each up to $L$ tokens. At $B = 128$, $G = 16$, $L = 512$: 2048 completions, $\sim$1M tokens. This is the dominant cost, 60--80\% of wall time (Chapter~4's cost breakdown).
 
 \subsubsection*{Stage 3: Reward Computation}
 
 Score each completion. In RLVR: run the verifier (unit tests, math checker, formal proof system). In RLHF: run the reward model forward pass. The reward type determines the signal quality and the failure modes (Chapter~4's RLVR vs.\ RLHF discussion).
 
 \begin{itemize}
-  \item \textbf{Deterministic verifiers} (unit tests, exact-match) are cheap and clean but binary --- pass or fail. Partial credit requires engineering (fraction of tests passed).
+  \item \textbf{Deterministic verifiers} (unit tests, exact-match) are cheap and clean but binary: pass or fail. Partial credit requires engineering (fraction of tests passed).
   \item \textbf{Neural reward models} are continuous-valued but gameable. The reward model is itself a bottleneck: a separate forward pass per completion through a model that may be as large as the policy.
 \end{itemize}
 
@@ -164,7 +165,7 @@ The stages are not independent knobs. Here are the interactions that catch peopl
 
   \item \textbf{Actor/learner ratio $\times$ staleness.} More actors relative to learners means higher aggregate throughput in Stage~2 but longer intervals between weight syncs in Stage~6. If you have 8 actor nodes generating rollouts while 1 learner node computes updates, the learner processes one batch while actors generate the next. But if actor throughput exceeds learner throughput, rollouts queue up, and by the time the learner processes them the weights have moved. The clipping threshold $\epsilon$ (Stage~5) implicitly caps the tolerable staleness.
 
-  \item \textbf{Reward cost $\times$ pipeline balance.} Neural reward models in Stage~3 require a separate forward pass that may rival the generation cost. If reward computation is slow, the pipeline stalls between Stages~2 and~4 --- generation hardware idles while rewards are computed. Verifiable rewards (unit tests, math checkers) are nearly free, which is one reason RLVR pipelines achieve higher hardware utilization than RLHF pipelines.
+  \item \textbf{Reward cost $\times$ pipeline balance.} Neural reward models in Stage~3 require a separate forward pass that may rival the generation cost. If reward computation is slow, the pipeline stalls between Stages~2 and~4, and generation hardware idles while rewards are computed. Verifiable rewards (unit tests, math checkers) are nearly free, which is one reason RLVR pipelines achieve higher hardware utilization than RLHF pipelines.
 \end{enumerate}
 
 \begin{exercise}[Pipeline Bottleneck Analysis]
@@ -189,17 +190,17 @@ You have the following configuration:
 \subsection*{Move 2: TinyRL as the Experimental Platform}
 % =======================================================================
 
-Understanding the pipeline diagram is necessary. Testing your understanding is what makes it stick. TinyRL is the platform for that testing --- small enough to iterate in minutes, rich enough to exhibit the phenomena that matter at scale.
+Understanding the pipeline diagram is necessary. Testing your understanding is what makes it stick. TinyRL is the platform for that testing, small enough to iterate in minutes, rich enough to exhibit the phenomena that matter at scale.
 
 \subsubsection*{Design Principles}
 
-The TinyStories paper (arXiv:2305.07759) showed that language model phenomena --- memorization, generalization, induction heads, grokking --- are observable at toy scale \textit{if the environment is designed carefully}. Four properties made it work:
+The TinyStories paper (arXiv:2305.07759) showed that language model phenomena (memorization, generalization, induction heads, grokking) are observable at toy scale \textit{if the environment is designed carefully}. Four properties made it work:
 
 \begin{enumerate}
   \item \textbf{Controlled data distribution.} The input distribution is known and manipulable, not scraped from the internet.
   \item \textbf{Tasks learnable by small models.} GPT-2 scale ($<$350M parameters, often $<$10M) is sufficient to exhibit the phenomena of interest.
   \item \textbf{Clean evaluation.} No ambiguity about what ``good'' means. Deterministic verification where possible.
-  \item \textbf{Phenomena observable at small scale.} The dynamics you care about --- reward hacking, entropy collapse, KL growth --- are visible without scaling to billions of parameters.
+  \item \textbf{Phenomena observable at small scale.} The dynamics you care about (reward hacking, entropy collapse, KL growth) are visible without scaling to billions of parameters.
 \end{enumerate}
 
 TinyRL maps each of these to the RL pipeline:
@@ -208,7 +209,7 @@ TinyRL maps each of these to the RL pipeline:
   \item \textbf{Curated prompt sets.} 50--100 tasks per environment, sampled reproducibly. The training distribution is known.
   \item \textbf{GPT-2 scale models.} $<$10M parameters. Train on a single GPU in under an hour. Cheap enough to ablate every hyperparameter.
   \item \textbf{Deterministic verification.} Unit tests pass or fail. Sentiment scores are computed by a fixed classifier. Inference cost is measurable. No human raters.
-  \item \textbf{RLVR phenomena in minutes.} Reward hacking, entropy collapse, emergent strategies, KL divergence growth --- all observable before lunch.
+  \item \textbf{RLVR phenomena in minutes.} Reward hacking, entropy collapse, emergent strategies, KL divergence growth, all observable before lunch.
 \end{enumerate}
 
 The reframing from Chapters~1--4: TinyRL is not a standalone framework. It is the \textit{experimental platform for testing the decisions from the previous four chapters.} When you change the batch size, quantization strategy, group size, or KL penalty, you run the experiment on TinyRL and measure whether policy improvement per compute dollar went up or down.
@@ -228,9 +229,9 @@ The headline environment. RLVR is the frontier paradigm. Code verification is th
   \item \textbf{Model:} GPT-2 scale ($<$10M parameters), trained from a pretrained checkpoint.
   \item \textbf{Task bank:} 50--100 curated programming puzzles, graded by difficulty:
     \begin{itemize}
-      \item \textit{Easy} --- implement a single function, verified by 1--3 unit tests (e.g., \texttt{reverse\_string}, \texttt{sum\_list}).
-      \item \textit{Medium} --- implement 2 cooperating functions, verified by 5 unit tests (e.g., a parser and a formatter).
-      \item \textit{Hard} --- implement an algorithm with edge cases, verified by 10 unit tests (e.g., BFS on an adjacency list, handling empty graph and disconnected nodes).
+      \item \textit{Easy:} implement a single function, verified by 1--3 unit tests (e.g., \texttt{reverse\_string}, \texttt{sum\_list}).
+      \item \textit{Medium:} implement 2 cooperating functions, verified by 5 unit tests (e.g., a parser and a formatter).
+      \item \textit{Hard:} implement an algorithm with edge cases, verified by 10 unit tests (e.g., BFS on an adjacency list, handling empty graph and disconnected nodes).
     \end{itemize}
   \item \textbf{Reward:} Fraction of unit tests passed. All pass: $r = 1.0$. None pass: $r = 0.0$. Partial credit for intermediate passes.
 \end{itemize}
@@ -260,7 +261,7 @@ These are the same exploit classes that frontier RLVR teams encounter at scale. 
   \item \textbf{Reward:} A pretrained sentiment classifier scores each completion. Positive sentiment = high reward.
 \end{itemize}
 
-The reward is a neural network, not a deterministic verifier. It can be gamed. The policy does not need to write a genuinely positive review --- it needs to write text that the classifier scores highly. These are not the same thing.
+The reward is a neural network, not a deterministic verifier. It can be gamed. The policy does not need to write a genuinely positive review; it needs to write text that the classifier scores highly. These are not the same thing.
 
 \textbf{RLHF dynamics exhibited:}
 \begin{itemize}
@@ -272,7 +273,7 @@ The reward is a neural network, not a deterministic verifier. It can be gamed. T
 
 All dynamics visible in under 30 minutes on a single GPU.
 
-\textbf{Pipeline testing:} TinyRL-Align is where the KL penalty coefficient $\beta$ (Chapter~4, Lever~2) and collapse detection (Chapter~4, Lever~4) matter most. The neural reward provides continuous signal, so advantage estimation is smoother than TinyRL-Code --- but the signal is gameable. The contrast with TinyRL-Code shows concretely why the field moved from neural proxy rewards to verifiable rewards, and at what cost.
+\textbf{Pipeline testing:} TinyRL-Align is where the KL penalty coefficient $\beta$ (Chapter~4, Lever~2) and collapse detection (Chapter~4, Lever~4) matter most. The neural reward provides continuous signal, so advantage estimation is smoother than TinyRL-Code, but the signal is gameable. The contrast with TinyRL-Code shows concretely why the field moved from neural proxy rewards to verifiable rewards, and at what cost.
 
 % --- TinyRL-Quant ---
 
@@ -294,7 +295,7 @@ The reward is fully verifiable: accuracy is computed on a fixed evaluation set, 
   \item \textbf{Eval-set gaming.} If the same evaluation set is used for reward and final assessment, the policy overfits to it. A held-out test set distinct from the reward set is essential.
 \end{itemize}
 
-\textbf{Pipeline testing:} TinyRL-Quant is Chapter~2's quantization tension made concrete. The RL agent \textit{learns to quantize its own layers}. The optimal quantization policy depends on what the model has learned --- RLVR-trained models may concentrate representations differently than SFT-only models, making the optimal per-layer precision assignment differ. This is a testable PE/RL intersection question: run TinyRL-Quant on the same architecture after SFT-only vs.\ after RLVR training, and compare which layers get high precision.
+\textbf{Pipeline testing:} TinyRL-Quant is Chapter~2's quantization tension made concrete. The RL agent \textit{learns to quantize its own layers}. The optimal quantization policy depends on what the model has learned, since RLVR-trained models may concentrate representations differently than SFT-only models, making the optimal per-layer precision assignment differ. This is a testable PE/RL intersection question: run TinyRL-Quant on the same architecture after SFT-only vs.\ after RLVR training, and compare which layers get high precision.
 
 % --- Verification spectrum diagram ---
 
@@ -375,7 +376,7 @@ Given a baseline TinyRL-Code configuration and a fixed compute budget:
 \end{portfolio}
 
 \begin{taste}
-The difference between a good engineer and a great one is the ability to predict which intervention will have the largest effect \textit{before} running the experiment. This exercise tests that skill directly. Anyone can try things and report numbers. The value is in the reasoning chain: why you chose this intervention, what you expected, and what you learned when reality disagreed. That reasoning chain --- not the final numbers --- is what makes this a portfolio piece.
+The difference between a good engineer and a great one is the ability to predict which intervention will have the largest effect \textit{before} running the experiment. This exercise tests that skill directly. Anyone can try things and report numbers. The value is in the reasoning chain: why you chose this intervention, what you expected, and what you learned when reality disagreed. That reasoning chain, not the final numbers, is what makes this a portfolio piece.
 \end{taste}
 
 % --- Additional exercises ---
@@ -406,6 +407,6 @@ Measure: (1)~final solve rate, (2)~advantage variance per prompt, (3)~fraction o
 
 \bigskip
 
-\textbf{What this chapter does not cover:} production-grade framework engineering (TinyRL is a learning platform, not a deployment system), scaling to thousands of nodes (the principles transfer; the systems engineering does not fit in a chapter), and novel RL algorithms (the pipeline is algorithm-agnostic --- swap GRPO for PPO or REINFORCE and the six-stage structure is unchanged). The goal is to make you dangerous with the complete loop at small scale, not to make you an expert in any single stage. The expertise is in the previous four chapters. The integration is here.
+\textbf{What this chapter does not cover:} production-grade framework engineering (TinyRL is a learning platform, not a deployment system), scaling to thousands of nodes (the principles transfer; the systems engineering does not fit in a chapter), and novel RL algorithms (the pipeline is algorithm-agnostic; swap GRPO for PPO or REINFORCE and the six-stage structure is unchanged). The goal is to make you dangerous with the complete loop at small scale, not to make you an expert in any single stage. The expertise is in the previous four chapters. The integration is here.
 
 \newpage

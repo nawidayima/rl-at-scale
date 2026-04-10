@@ -1,10 +1,11 @@
+% !TEX root = ../textbook.tex
 \section*{Policy Gradients}
 \addcontentsline{toc}{section}{4\quad Policy Gradients}
 
 \smallskip
 
 \begin{whythis}
-You built a rollout generation system (Chapter~3). This chapter teaches you what happens to those rollouts --- and why understanding the consumer is essential to optimizing the producer. Every algorithmic choice here has a systems consequence: it changes how many rollouts you need, how fresh they must be, and how much each one costs.
+You built a rollout generation system (Chapter~3). This chapter teaches you what happens to those rollouts, and why understanding the consumer is essential to optimizing the producer. Every algorithmic choice here has a systems consequence: it changes how many rollouts you need, how fresh they must be, and how much each one costs.
 \end{whythis}
 
 % -----------------------------------------------------------------------
@@ -45,7 +46,7 @@ wall_clock_per_step =
 \end{tikzpicture}
 \end{center}
 
-Ranges are regime-dependent --- they shift with model size, sequence length, and hardware. The point is the ordering, not the exact numbers. Rollout generation is 60--80\% of wall-clock --- this is why Chapter~3 is the centerpiece of this book. Cutting rollout count in half saves 30--40\% of total training cost. Cutting optimizer steps in half saves 3--8\%.
+Ranges are regime-dependent and shift with model size, sequence length, and hardware. The point is the ordering, not the exact numbers. Rollout generation is 60--80\% of wall-clock time, which is why Chapter~3 is the centerpiece of this book. Cutting rollout count in half saves 30--40\% of total training cost. Cutting optimizer steps in half saves 3--8\%.
 
 Your job as you read this chapter: understand the consumer well enough to make informed producer decisions. The batch size, quantization strategy, and actor/learner ratio you chose in Chapter~3 for throughput reasons all have direct algorithmic consequences here. Each lever below tells you what those consequences are.
 
@@ -62,13 +63,13 @@ Which improvement would you staff an engineer on first?
 \medskip
 \textbf{The four levers,} ordered by cost impact:
 \begin{enumerate}
-  \item \textbf{Rollout allocation} --- how many rollouts per prompt, and which prompts get them
-  \item \textbf{KL regularization} --- how tightly the policy tracks its reference
-  \item \textbf{Credit assignment} --- whether gradient signal targets the tokens that mattered
-  \item \textbf{Collapse detection} --- how early you detect that continued training is waste
+  \item \textbf{Rollout allocation:} how many rollouts per prompt, and which prompts get them
+  \item \textbf{KL regularization:} how tightly the policy tracks its reference
+  \item \textbf{Credit assignment:} whether gradient signal targets the tokens that mattered
+  \item \textbf{Collapse detection:} how early you detect that continued training is waste
 \end{enumerate}
 
-The first three are ordered by steady-state cost impact. The fourth prevents catastrophic waste rather than improving per-step efficiency --- a single early intervention can save more compute than all other levers combined.
+The first three are ordered by steady-state cost impact. The fourth prevents catastrophic waste rather than improving per-step efficiency, since a single early intervention can save more compute than all other levers combined.
 
 % -----------------------------------------------------------------------
 \subsection*{Lever 1: Rollout Allocation and Clipping}
@@ -87,24 +88,24 @@ Derive: the cost-optimal $G$ minimizes total compute to reach a target reward. I
 Under the simplifying assumption $N(G) \propto 1/G$ (linear variance reduction), cost is minimized as $G \to \infty$. Why does this not hold in practice? What determines the finite optimum?
 \end{thinkfirst}
 
-The assumption $N(G) \propto 1/G$ breaks because $N(G)$ flattens once gradient variance drops below the \textit{bias floor} --- the irreducible error from advantage estimation, stale rollouts, and reward noise. Below that floor, additional rollouts reduce variance that was not the binding constraint. The real optimum is finite and depends on the prompt distribution.
+The assumption $N(G) \propto 1/G$ breaks because $N(G)$ flattens once gradient variance drops below the \textit{bias floor}, the irreducible error from advantage estimation, stale rollouts, and reward noise. Below that floor, additional rollouts reduce variance that was not the binding constraint. The real optimum is finite and depends on the prompt distribution.
 
-\textbf{Waste pattern: dead rollouts.} GRPO normalizes advantages within each group: $\hat{A}_i = (R_i - \bar{R}) / \sigma_R$. For prompts where all $G$ rollouts get similar rewards ($\sigma_R \approx 0$), normalized advantages are near-zero. Those rollouts produce negligible gradient signal. If 30\% of prompts have low reward variance --- easy problems the model already solves reliably, or hard problems it consistently fails --- then $\sim$30\% of the rollout budget produces near-zero learning.
+\textbf{Waste pattern: dead rollouts.} GRPO normalizes advantages within each group: $\hat{A}_i = (R_i - \bar{R}) / \sigma_R$. For prompts where all $G$ rollouts get similar rewards ($\sigma_R \approx 0$), normalized advantages are near-zero. Those rollouts produce negligible gradient signal. If 30\% of prompts have low reward variance (easy problems the model already solves reliably, or hard problems it consistently fails), then $\sim$30\% of the rollout budget produces near-zero learning.
 
 \textbf{Cost impact.} Napkin math: a 7B model GRPO run at $G = 16$ with 100K prompts over 5K steps generates 8 billion rollout tokens. If 30\% are dead rollouts, that is 2.4 billion tokens of inference for near-zero gradient signal. At $\sim$\$0.01 per 1K inference tokens, that is $\sim$\$24K wasted on a single run.
 
-\textbf{Systems reality.} $G$ rollouts from the same prompt share the prompt's KV cache --- the prompt forward pass is computed once and reused across all $G$ completions. Going from $G = 8$ to $G = 16$ adds 8 completion forward passes, not 8 full forward passes. This makes larger $G$ cheaper than the naive cost model predicts.
+\textbf{Systems reality.} $G$ rollouts from the same prompt share the prompt's KV cache, so the prompt forward pass is computed once and reused across all $G$ completions. Going from $G = 8$ to $G = 16$ adds 8 completion forward passes, not 8 full forward passes. This makes larger $G$ cheaper than the naive cost model predicts.
 
 But: KV cache for $G$ completions must fit in HBM simultaneously. At $G = 16$ with long prompts, you can hit memory limits that force smaller batch sizes, which hurts GPU utilization. The real constraint is $G \times \text{batch\_size} \times \text{seq\_len} \leq \text{HBM budget}$.
 
-\textbf{Batch size interacts with clipping.} Too-small batches produce high-variance advantage estimates that clipping cannot save. PPO/GRPO clipping bounds the importance ratio $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\mathrm{old}}(a_t|s_t)$ to $[1 - \epsilon, 1 + \epsilon]$. This limits the size of any single update, but does nothing about the \textit{direction} --- if the advantage estimate is wrong due to high variance, clipping faithfully executes a wrong update at a bounded magnitude. The batch size you chose in Chapter~3 for throughput reasons has a direct algorithmic consequence here: it determines whether advantage estimates are reliable enough for clipping to help rather than merely limit damage.
+\textbf{Batch size interacts with clipping.} Too-small batches produce high-variance advantage estimates that clipping cannot save. PPO/GRPO clipping bounds the importance ratio $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\mathrm{old}}(a_t|s_t)$ to $[1 - \epsilon, 1 + \epsilon]$. This limits the size of any single update, but does nothing about the \textit{direction}. If the advantage estimate is wrong due to high variance, clipping faithfully executes a wrong update at a bounded magnitude. The batch size you chose in Chapter~3 for throughput reasons has a direct algorithmic consequence here: it determines whether advantage estimates are reliable enough for clipping to help rather than merely limit damage.
 
 \textbf{Literature (established solutions).} This problem is solved. Multiple papers from early 2026 address adaptive rollout allocation:
 
 \begin{itemize}
   \item \textbf{VIP} (\href{https://arxiv.org/abs/2602.01601}{arXiv:2602.01601}, 2026): Variance-Informed Predictive allocation. A Gaussian process predicts per-prompt success probabilities from recent rollouts. These predictions feed a convex optimization problem that allocates rollout budget to minimize expected gradient variance under a hard compute constraint.
   \item \textbf{AERO} (\href{https://arxiv.org/abs/2602.14338}{arXiv:2602.14338}, 2026): Adaptive rollout strategy with selective rejection and a Bayesian posterior to prevent zero-advantage dead zones. Reports 48\% compute reduction on 1.5B and 47\% on 7B models.
-  \item \textbf{Prompt Replay} (\href{https://arxiv.org/abs/2603.21177}{arXiv:2603.21177}, 2026): On-policy reuse of high-signal prompts --- skip prompts that have become too easy or too hard, replay prompts in the high-learning zone.
+  \item \textbf{Prompt Replay} (\href{https://arxiv.org/abs/2603.21177}{arXiv:2603.21177}, 2026): On-policy reuse of high-signal prompts by skipping prompts that have become too easy or too hard, replay prompts in the high-learning zone.
 \end{itemize}
 
 \begin{exercise}[Rollout Allocation Efficiency]
@@ -121,7 +122,7 @@ Plot reward/GPU-second vs.\ $G$. Is there a clear optimum?
 
 \textbf{Part 3: Analysis.} Does the dead rollout rate increase over training (as the policy improves on easy prompts)? If so, a fixed $G$ becomes increasingly wasteful. Plot dead rollout rate over training steps for each fixed $G$. Does adaptive allocation keep the dead rollout rate low?
 
-\textbf{What to investigate next.} Read VIP and AERO in full. Both assume reward variance is a good proxy for gradient information --- is this true when the advantage estimator introduces its own bias? Compare VIP's Gaussian process approach against AERO's Bayesian posterior. Which is cheaper to maintain at scale?
+\textbf{What to investigate next.} Read VIP and AERO in full. Both assume reward variance is a good proxy for gradient information, but is this true when the advantage estimator introduces its own bias? Compare VIP's Gaussian process approach against AERO's Bayesian posterior. Which is cheaper to maintain at scale?
 \end{exercise}
 
 % -----------------------------------------------------------------------
@@ -150,9 +151,9 @@ What would an adaptive schedule look like?
 
 \textbf{Waste pattern.} Over-regularization wastes gradually: each step is slightly less efficient because $\beta$ constrains updates that would have been safe. Under-regularization wastes catastrophically: the policy drifts into collapse or reward-hacking, and hundreds of steps are spent recovering. The cost of getting $\beta$ wrong is dominated by the catastrophic tail.
 
-Early in training, $\beta$ barely constrains --- the reference forward pass (5--10\% of step time per the cost breakdown) produces no useful signal. Late in training, the same $\beta$ may be too loose, causing collapse-and-recovery episodes that consume hundreds of steps.
+Early in training, $\beta$ barely constrains, and the reference forward pass (5--10\% of step time per the cost breakdown) produces no useful signal. Late in training, the same $\beta$ may be too loose, causing collapse-and-recovery episodes that consume hundreds of steps.
 
-\textbf{The freshness connection.} KL penalty directly determines how quickly your rollouts go stale. Tight KL (large $\beta$) means the policy moves slowly --- rollouts stay on-policy longer, relaxing Chapter~3's freshness constraint. You can get away with a larger actor/learner ratio and more reuse of generated rollouts. Loose KL (small $\beta$) means the policy changes fast --- you need fresher rollouts, more generation throughput, and tighter synchronization between the actor and learner from Chapter~3. The algorithmic choice of $\beta$ has a direct systems consequence for how you architect the generation pipeline.
+\textbf{The freshness connection.} KL penalty directly determines how quickly your rollouts go stale. Tight KL (large $\beta$) means the policy moves slowly, so rollouts stay on-policy longer, relaxing Chapter~3's freshness constraint. You can get away with a larger actor/learner ratio and more reuse of generated rollouts. Loose KL (small $\beta$) means the policy changes fast, so you need fresher rollouts, more generation throughput, and tighter synchronization between the actor and learner from Chapter~3. The algorithmic choice of $\beta$ has a direct systems consequence for how you architect the generation pipeline.
 
 \textbf{Systems reality.} The reference model consumes HBM. Common workarounds and their cost profiles:
 \begin{itemize}
@@ -183,7 +184,7 @@ Measure at every step: reward/GPU-second, $D_{\mathrm{KL}}(\pi_\theta \| \pi_{\m
 
 \textbf{Questions.} Does PID outperform the simple heuristic? By enough to justify the implementation complexity? Does adaptive scheduling prevent collapse episodes that the fixed conditions hit? Which fixed $\beta$ is closer to the adaptive performance?
 
-\textbf{What to investigate next.} Read SAFE and APO. SAFE uses PID control --- is the integral term necessary, or does proportional control suffice? APO schedules across divergence families, not just $\beta$ magnitude --- does the choice of forward vs.\ reverse KL matter more than the coefficient?
+\textbf{What to investigate next.} Read SAFE and APO. SAFE uses PID control; is the integral term necessary, or does proportional control suffice? APO schedules across divergence families, not just $\beta$ magnitude; does the choice of forward vs.\ reverse KL matter more than the coefficient?
 \end{exercise}
 
 % -----------------------------------------------------------------------
@@ -203,24 +204,24 @@ In a 512-token math reasoning trace, suppose $\sim$20 tokens are critical (an al
 \textbf{(b)} How does this connect to the rollout budget from Lever~1? If gradient variance is 25$\times$ higher than it needs to be, how many extra rollouts does that require to compensate?
 \end{thinkfirst}
 
-The naive story --- ``GRPO only does sequence-level credit'' --- is wrong. Recent work shows GRPO already performs implicit token-level credit assignment.
+The naive story that ``GRPO only does sequence-level credit'' is wrong. Recent work shows GRPO already performs implicit token-level credit assignment.
 
-\textbf{The implicit credit mechanism.} Sullivan et al.\ (\href{https://arxiv.org/abs/2509.21154}{arXiv:2509.21154}, ``GRPO is Secretly a PRM,'' 2025) prove that GRPO with outcome rewards is equivalent to a process-reward-model-aware RL objective with Monte-Carlo-based process rewards, whenever trajectories within a group share prefixes. In practice, $G$ rollouts from the same prompt often share long prefixes --- the model generates similar openings. Where prefixes overlap, GRPO assigns differential credit to the divergence points: implicit token-level credit without a critic.
+\textbf{The implicit credit mechanism.} Sullivan et al.\ (\href{https://arxiv.org/abs/2509.21154}{arXiv:2509.21154}, ``GRPO is Secretly a PRM,'' 2025) prove that GRPO with outcome rewards is equivalent to a process-reward-model-aware RL objective with Monte-Carlo-based process rewards, whenever trajectories within a group share prefixes. In practice, $G$ rollouts from the same prompt often share long prefixes because the model generates similar openings. Where prefixes overlap, GRPO assigns differential credit to the divergence points: implicit token-level credit without a critic.
 
 This implicit mechanism breaks down when:
 \begin{itemize}
-  \item Prefixes are short (the model generates diverse openings --- common for creative or open-ended tasks)
+  \item Prefixes are short (the model generates diverse openings, common for creative or open-ended tasks)
   \item $G$ is small (fewer shared prefixes)
   \item The critical decision is early in the sequence (before prefixes diverge)
 \end{itemize}
 
-\textbf{Waste pattern.} When the implicit mechanism fails, you pay the full gradient variance tax from uniform credit. This inflates the required $G$ for stable training --- linking back to Lever~1. Poor credit assignment is a hidden multiplier on rollout cost.
+\textbf{Waste pattern.} When the implicit mechanism fails, you pay the full gradient variance tax from uniform credit. This inflates the required $G$ for stable training, linking back to Lever~1. Poor credit assignment is a hidden multiplier on rollout cost.
 
-\textbf{GAE and rollout length.} Generalized Advantage Estimation (GAE) uses an exponentially-weighted combination of $n$-step returns, controlled by $\lambda$. When $\lambda$ is high, GAE propagates reward signal further back in the trajectory, giving better credit assignment for early decisions --- but only if the rollout is long enough to contain the relevant signal. GAE's $\lambda$ parameter interacts with rollout length: longer rollouts give GAE more signal to work with, but cost more to generate in Chapter~3. This creates a direct link between credit assignment quality and your generation throughput budget.
+\textbf{GAE and rollout length.} Generalized Advantage Estimation (GAE) uses an exponentially-weighted combination of $n$-step returns, controlled by $\lambda$. When $\lambda$ is high, GAE propagates reward signal further back in the trajectory, giving better credit assignment for early decisions, but only if the rollout is long enough to contain the relevant signal. GAE's $\lambda$ parameter interacts with rollout length: longer rollouts give GAE more signal to work with, but cost more to generate in Chapter~3. This creates a direct link between credit assignment quality and your generation throughput budget.
 
 \textbf{Explicit alternatives.} Multiple methods improve on implicit credit, each with a different compute profile:
 \begin{itemize}
-  \item \textbf{GRPO-$\lambda$} (OpenReview): eligibility traces using token-level log-probabilities. Explicit credit without a learned critic. Negligible overhead --- reuses existing log-probs.
+  \item \textbf{GRPO-$\lambda$} (OpenReview): eligibility traces using token-level log-probabilities. Explicit credit without a learned critic. Negligible overhead; reuses existing log-probs.
   \item \textbf{GTPO/GRPO-S} (\href{https://arxiv.org/abs/2508.04349}{arXiv:2508.04349}, 2025): entropy-weighted per-token reward shaping via Dynamic Entropy Weighting. Small overhead (entropy computation per token).
   \item \textbf{SPO} (\href{https://arxiv.org/abs/2505.23564}{arXiv:2505.23564}, 2025): segment-level advantages. More precise than sequence-level, fewer estimation points than token-level. Moderate overhead (segment boundary detection).
   \item \textbf{Learned critic} (PPO-style): $\sim$30--50\% memory overhead $+$ $\sim$20\% step time for critic forward and backward passes.
@@ -244,7 +245,7 @@ Measure: reward/GPU-second (including all overhead), gradient norm variance, con
 
 \textbf{Prefix analysis.} Measure the actual prefix-sharing rate in your runs: what fraction of rollout pairs within a group share $> 50$\% of tokens? If high, implicit credit may be sufficient and explicit methods add cost for little gain. If low, GRPO-$\lambda$ or SPO become high-value.
 
-\textbf{What to investigate next.} Read ``GRPO is Secretly a PRM'' carefully. The proof relies on shared prefixes. Does prefix-sharing rate change over training (as the policy becomes more deterministic)? If so, implicit credit improves as training progresses --- exactly when it matters most.
+\textbf{What to investigate next.} Read ``GRPO is Secretly a PRM'' carefully. The proof relies on shared prefixes. Does prefix-sharing rate change over training (as the policy becomes more deterministic)? If so, implicit credit improves as training progresses, exactly when it matters most.
 \end{exercise}
 
 % -----------------------------------------------------------------------
@@ -274,12 +275,12 @@ Under standard symmetric clipping ($\epsilon = 0.2$), the clip-high entropy-redu
   \draw[-{Stealth[length=4pt]}, sumi!50] (-0.3,0) -- (7,0) node[right] {tokens};
   \draw[-{Stealth[length=4pt]}, sumi!50] (0,-0.05) -- (0,1.2) node[above] {$\pi(a|s)$};
 
-  % Before clipping — spread distribution
+  % before clipping (broad)
   \draw[aiiro!60, thick, smooth] plot coordinates
     {(0.5,0.05) (1,0.15) (2,0.35) (3,0.55) (4,0.35) (5,0.15) (6,0.05)};
   \node[aiiro!60, above] at (3, 0.58) {before};
 
-  % After clip-high only — concentrated
+  % after clip-high (peaked)
   \draw[beni!60, thick, smooth, dashed] plot coordinates
     {(0.5,0.02) (1,0.05) (2,0.15) (3,0.85) (4,0.15) (5,0.03) (6,0.01)};
   \node[beni!60, above] at (4.5, 0.35) {after clip-high};
@@ -297,7 +298,7 @@ Under standard symmetric clipping ($\epsilon = 0.2$), the clip-high entropy-redu
 \textbf{Work through:} if clip-high is the root cause, what does asymmetric clipping ($\epsilon_{\mathrm{low}} = 0.2$, $\epsilon_{\mathrm{high}} = 0.1$) do to the entropy trajectory?
 \end{thinkfirst}
 
-Token-level analysis (\href{https://arxiv.org/abs/2510.10150}{arXiv:2510.10150}, ``Rethinking Entropy Interventions,'' 2025): entropy change per update is governed by four factors --- clipping strategy, advantage sign, token probability, and token entropy. This gives a precise diagnostic: you can predict which tokens will lose entropy fastest.
+Token-level analysis (\href{https://arxiv.org/abs/2510.10150}{arXiv:2510.10150}, ``Rethinking Entropy Interventions,'' 2025): entropy change per update is governed by four factors: clipping strategy, advantage sign, token probability, and token entropy. This gives a precise diagnostic: you can predict which tokens will lose entropy fastest.
 
 \textbf{Waste pattern.} Every step after collapse begins is wasted compute. In long runs, collapse might begin at step 3000 but not be noticed until step 5000. Recovery is difficult: Adam's moment estimates have adapted to the collapsed regime, carrying stale curvature information. Entropy collapse means the model stops exploring, rollouts become homogeneous, and training signal degrades regardless of how much throughput Chapter~3 delivers.
 
@@ -331,7 +332,7 @@ Intervention options with different cost profiles:
 
 \textbf{Part 1: Reproduce the finding.} Train GRPO on TinyRL-Code (Chapter~5, 124M) with standard symmetric clipping ($\epsilon = 0.2$). Log at every step: policy entropy (mean over batch), reward std across rollouts, top-1 token probability, gradient norm. Log effective rank every 50 steps.
 
-\textbf{Part 2: Asymmetric clipping.} Train with $\epsilon_{\mathrm{low}} = 0.2$, $\epsilon_{\mathrm{high}} = 0.1$. Compare the entropy trajectory against Part~1. Does asymmetric clipping slow or prevent entropy collapse? What happens to final reward --- does preserving entropy help or hurt?
+\textbf{Part 2: Asymmetric clipping.} Train with $\epsilon_{\mathrm{low}} = 0.2$, $\epsilon_{\mathrm{high}} = 0.1$. Compare the entropy trajectory against Part~1. Does asymmetric clipping slow or prevent entropy collapse? What happens to final reward? Does preserving entropy help or hurt?
 
 \textbf{Part 3: Automated detection and intervention.} Implement threshold-based detection: trigger when entropy drops below its 200-step moving average by $> 2$ standard deviations. Compare two interventions:
 \begin{enumerate}[label=(\roman*)]
@@ -342,7 +343,7 @@ Which recovers faster? Which reaches higher final reward?
 
 \textbf{Analysis.} Which metric first signals collapse onset? How many steps of warning does the earliest signal give before entropy drops below 0.1?
 
-\textbf{What to investigate next.} The four-factor model from ``Rethinking Entropy Interventions'' predicts which tokens lose entropy fastest. Can you build a targeted intervention --- adjust clipping only for high-risk tokens rather than globally?
+\textbf{What to investigate next.} The four-factor model from ``Rethinking Entropy Interventions'' predicts which tokens lose entropy fastest. Can you build a targeted intervention that adjusts clipping only for high-risk tokens rather than globally?
 \end{exercise}
 
 % -----------------------------------------------------------------------
@@ -351,7 +352,7 @@ Which recovers faster? Which reaches higher final reward?
 
 Everything above assumes the reward signal is cheap. That assumption depends on how you compute it.
 
-\textbf{Rule-based verification (RLVR).} A deterministic function checks whether the rollout's output is correct: does the generated code pass unit tests, does the math answer match the ground truth? Cost per rollout: negligible --- a string comparison or test execution, orders of magnitude cheaper than a model forward pass. The constraint: you need tasks with verifiable answers. This limits the task distribution to math, code, formal reasoning, and similar domains with ground-truth signals.
+\textbf{Rule-based verification (RLVR).} A deterministic function checks whether the rollout's output is correct: does the generated code pass unit tests, does the math answer match the ground truth? Cost per rollout: negligible, a string comparison or test execution, orders of magnitude cheaper than a model forward pass. The constraint: you need tasks with verifiable answers. This limits the task distribution to math, code, formal reasoning, and similar domains with ground-truth signals.
 
 \textbf{Learned reward model.} A separate neural network scores each rollout. Cost per rollout: one additional forward pass through the reward model. For a reward model that is a fraction of the policy's size (common: 1/4 to 1/2), this adds 10--20\% to the per-rollout cost in Chapter~3's generation pipeline. For a reward model the same size as the policy, it roughly doubles the cost. This directly increases the cost denominator of the north star metric (reward per GPU-second).
 
@@ -359,7 +360,7 @@ Everything above assumes the reward signal is cheap. That assumption depends on 
 
 \begin{itemize}
   \item With rule-based verification, rollout generation dominates cost (60--80\%, as shown above). Optimizing Chapter~3's generation throughput is the highest-leverage investment.
-  \item With a learned reward model, the reward computation share grows from 5--10\% to 15--30\% or more. Now reward model inference competes with generation for optimization attention. You may want to quantize the reward model, batch reward scoring, or use a smaller reward model --- each with its own accuracy-cost tradeoff.
+  \item With a learned reward model, the reward computation share grows from 5--10\% to 15--30\% or more. Now reward model inference competes with generation for optimization attention. You may want to quantize the reward model, batch reward scoring, or use a smaller reward model, each with its own accuracy-cost tradeoff.
   \item Learned reward models can be wrong. When the reward model has systematic biases, the policy exploits them (reward hacking). This makes KL regularization (Lever~2) more important: the KL penalty is your main defense against the policy drifting into reward-model blind spots.
 \end{itemize}
 
@@ -367,7 +368,7 @@ Everything above assumes the reward signal is cheap. That assumption depends on 
 \subsection*{Ablation as Core Experimental Skill}
 % -----------------------------------------------------------------------
 
-The four levers above are not things to memorize --- they are things to test. The core skill this chapter teaches is ablation: systematically isolating whether a design choice is load-bearing by removing or varying it and measuring the impact.
+The four levers above are not things to memorize but things to test. The core skill this chapter teaches is ablation: systematically isolating whether a design choice is load-bearing by removing or varying it and measuring the impact.
 
 \textbf{How to design an ablation.} Every ablation has three components:
 \begin{enumerate}
@@ -376,7 +377,7 @@ The four levers above are not things to memorize --- they are things to test. Th
   \item \textbf{Decision-relevant metric.} Measure policy improvement per dollar (reward/GPU-second), not just final reward. A lever that improves final reward by 2\% but costs 30\% more compute is not load-bearing for cost efficiency.
 \end{enumerate}
 
-\textbf{Example: ablating KL penalty.} Run two TinyRL experiments: $\beta = 0.04$ vs.\ $\beta = 0$, both at 124M for 2000 steps. Measure reward/GPU-second and held-out reward divergence. If $\beta = 0$ matches on both metrics, KL penalty is not load-bearing at this scale and you can drop the reference model forward pass --- saving 5--10\% of step time and freeing HBM for larger batch sizes in Chapter~3.
+\textbf{Example: ablating KL penalty.} Run two TinyRL experiments: $\beta = 0.04$ vs.\ $\beta = 0$, both at 124M for 2000 steps. Measure reward/GPU-second and held-out reward divergence. If $\beta = 0$ matches on both metrics, KL penalty is not load-bearing at this scale and you can drop the reference model forward pass, saving 5--10\% of step time and freeing HBM for larger batch sizes in Chapter~3.
 
 \begin{exercise}[Ablation Design for Each Lever]
 
@@ -393,7 +394,7 @@ Design a cheap ablation for each of the four levers. For each, state:
 
 \textbf{Lever 3 (Credit assignment):} Does GRPO-$\lambda$ reach 80\% solve rate at lower $G$ than standard GRPO? If yes, Chapter~3 can generate fewer rollouts per prompt while maintaining the same learning rate.
 
-\textbf{Lever 4 (Collapse detection):} Does asymmetric clipping ($\epsilon_{\mathrm{low}} = 0.2$, $\epsilon_{\mathrm{high}} = 0.1$) prevent entropy collapse that symmetric clipping ($\epsilon = 0.2$) hits? If yes, the training run is more robust and you waste fewer steps on recovery --- reducing total generation cost.
+\textbf{Lever 4 (Collapse detection):} Does asymmetric clipping ($\epsilon_{\mathrm{low}} = 0.2$, $\epsilon_{\mathrm{high}} = 0.1$) prevent entropy collapse that symmetric clipping ($\epsilon = 0.2$) hits? If yes, the training run is more robust and you waste fewer steps on recovery, reducing total generation cost.
 
 Run at least one of these ablations. Report: hypothesis, result, and whether the result changes a decision you made in Chapter~3.
 \end{exercise}
@@ -430,13 +431,13 @@ Top-1 token prob       & Determinism proxy              & 4 \\
 \begin{itemize}
   \item \textbf{Reward over-optimization.} Held-out reward diverges from training reward. The policy is specializing to the training prompt distribution or exploiting verifier-specific patterns. \textit{Signal:} training reward rises while held-out reward plateaus or drops. \textit{Intervention:} increase $\beta$, diversify prompt set.
 
-  \item \textbf{Length gaming.} Completions grow longer without improving quality --- reward per token drops. The policy discovers that longer outputs score slightly higher due to verifier artifacts. \textit{Signal:} mean completion length increases while reward/token decreases. \textit{Intervention:} add length penalty to reward, or normalize reward by completion length.
+  \item \textbf{Length gaming.} Completions grow longer without improving quality, and reward per token drops. The policy discovers that longer outputs score slightly higher due to verifier artifacts. \textit{Signal:} mean completion length increases while reward/token decreases. \textit{Intervention:} add length penalty to reward, or normalize reward by completion length.
 
   \item \textbf{Gradient explosion / NaN.} Triggered by rare high-reward outliers with extreme log-probabilities. A single rollout with reward $10\times$ the batch mean creates a gradient spike that destabilizes training. \textit{Signal:} gradient norm spikes by $> 10\times$ its moving average. \textit{Intervention:} gradient clipping (already standard), reward clipping, or outlier filtering in the advantage computation.
 
   \item \textbf{Straggler amplification.} In distributed rollout generation, one slow completion (e.g., a prompt that elicits a very long response) holds up the entire batch. With $G = 16$ and 100 prompts, one 4096-token completion among 1600 that average 512 tokens wastes GPU-seconds across all workers. \textit{Signal:} high variance in per-prompt generation time. \textit{Intervention:} generation length caps, asynchronous rollout collection, or padding-aware batching. See Chapter~5 for the distributed systems perspective.
 \end{itemize}
 
-\textbf{Logging cost as compute allocation.} Not everything should be logged every step. Effective rank requires SVD --- expensive for large vocabularies. Log every 50--100 steps. Held-out reward requires inference on a separate prompt set --- log every 200--500 steps. Dashboard design is itself a cost decision.
+\textbf{Logging cost as compute allocation.} Not everything should be logged every step. Effective rank requires SVD, which is expensive for large vocabularies. Log every 50--100 steps. Held-out reward requires inference on a separate prompt set; log every 200--500 steps. Dashboard design is itself a cost decision.
 
 \newpage

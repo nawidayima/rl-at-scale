@@ -1,4 +1,4 @@
-.PHONY: textbook all-chapters clean
+.PHONY: textbook all-chapters clean publish
 
 TEXBIN := /Library/TeX/texbin
 LATEXMK := $(TEXBIN)/latexmk
@@ -34,6 +34,14 @@ all-chapters:
 		mv build/_ch_tmp.pdf build/$$name.pdf; \
 		rm -f _ch_tmp.tex; \
 	done
+
+publish: build/textbook.pdf
+	mkdir -p pdf
+	cp build/textbook.pdf pdf/textbook.pdf
+	@if ls build/0*.pdf 1>/dev/null 2>&1; then \
+		cp build/0*.pdf pdf/; \
+	fi
+	@echo "PDFs copied to pdf/"
 
 clean:
 	rm -rf build

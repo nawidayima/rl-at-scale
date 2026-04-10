@@ -1,19 +1,18 @@
+% !TEX root = ../textbook.tex
 \section*{Introduction}
 \addcontentsline{toc}{section}{Introduction}
 
-Frontier AI labs are valued at hundreds of billions of dollars on the premise that they will achieve AGI. These valuations are sustained by related-party investment cycles --- GPU suppliers, cloud providers, and strategic partners funding each other. This is not a stable equilibrium. When capital markets tighten, the labs that survive are the ones whose unit economics justify their existence independently.
+The hardest problems of the next two decades (energy production, semiconductor manufacturing, human healthspan, environmental sustainability) will need better tools and more people working on them. Right now, the on-ramp to contributing at the frontier is unnecessarily steep: years of specialized training, the right credentials, access to the right institutions. This series, The Critical Path, is about lowering that barrier by teaching cross-disciplinary thinking and practical skills that transfer across problem domains.
 
-Responsible AGI development requires fiscal sustainability. A lab that cannot cover the cost of its own inference workloads is a lab that depends on the next funding round to keep the lights on. This book is about making that cost as low as physics allows.
+\subsection*{Why AI Capability Comes First}
 
-\subsection*{Inference Is the Largest Variable Cost}
+As of early 2026, frontier AI labs carry significant fixed commitments: multi-year compute rental contracts on the order of \$10--13B per year per gigawatt of capacity, against revenue that depends on the variable cost of serving each token. A lab generating \$20B in annual revenue with gross margins below 50\% has little room between what it earns and what it spends on compute. Growing capacity requires further capital investment that can exceed current revenue. The cost per token is what determines whether the economics work.
 
-The case for serving is obvious. Every API call, every conversation, every enterprise deployment runs inference. Revenue comes from inference. The cost of generating tokens at scale is the single largest variable expense a frontier lab faces. This is not controversial --- it is the default framing for anyone who has seen the bills.
+AI is a meta-tool: making it smarter accelerates progress on every other problem this series will address. Smarter models come from reinforcement learning. RL from verifiable rewards is how frontier models improve after pretraining, and RL is bottlenecked by rollout generation, which is autoregressive token sampling that consumes 50--70\% of training wall-clock time. Rollout generation is an inference workload. More rollouts per dollar produce better gradient estimates, which produce smarter models.
 
-The less obvious case: \textbf{RL training loops are also inference workloads.} Reinforcement learning from verifiable rewards (RLVR) requires generating thousands of rollouts per policy update. Rollout generation --- autoregressive token sampling across large batches --- dominates RL training cost, consuming 50--70\% of wall-clock time. The boundary between ``inference'' and ``training'' collapses. The same kernels, the same memory-bandwidth bottlenecks, the same batching strategies that determine serving cost also determine training cost.
+Every technique that reduces inference cost simultaneously improves margins on serving revenue and increases the number of rollouts per dollar of training compute, because rollout generation and production serving are the same workload. That convergence is why inference optimization is the first volume in this series.
 
-This is where the hardest optimization problems live. And the skills transfer directly: every technique that makes rollout generation faster also makes production serving cheaper.
-
-\subsection*{This Book's Focus}
+We measure every chapter against a single metric:
 
 \begin{tcolorbox}[colback=beni!5!white, colframe=beni!80!black, boxrule=0.6pt,
   left=5pt, right=5pt, top=6pt, bottom=6pt,
@@ -24,11 +23,39 @@ This is where the hardest optimization problems live. And the skills transfer di
 Every chapter in this book is evaluated against this metric. A kernel optimization matters if it increases rollout throughput per dollar. A policy gradient variant matters if it extracts more improvement from the same rollouts. Everything else is interesting but off-topic.
 \end{tcolorbox}
 
-\textbf{Convergence thesis.} Performance engineering and research engineering are not separate disciplines with separate textbooks. The person who understands GPU memory hierarchies \textit{and} policy gradient variance is the person who can identify whether a training run is slow because of a systems bottleneck or an algorithmic one. This book addresses a single reader responsible for both perspectives.
+\subsection*{Principles}
 
-\textbf{Experimental philosophy.} Test the riskiest assumption at the smallest informative scale. This is the TinyStories principle: design experimental setups where small scale preserves the phenomenon under study. A 1M-parameter model on a single GPU can exhibit the same memory-wall behavior as a 70B-parameter model on a cluster --- if the experiment is designed correctly. We do not prescribe compute budgets. We prescribe the discipline of knowing what your experiment is testing before you run it.
+This book rests on four commitments about how to do good work in this field. They shape every chapter, exercise, and design decision that follows.
+
+\paragraph{Follow the problem, not the silo.}
+The hardest problems in this field cross the boundary between systems engineering and ML research. A slow training run might be a memory-bandwidth bottleneck or a policy gradient variance problem, and you cannot diagnose it from only one side. This book treats both as one discipline, because at the frontier, they are. It asks the same of you: a multi-disciplinary mindset over a specialized title.
+
+\paragraph{Prioritize ruthlessly and test cheaply.}
+Before building infrastructure around an idea, find the riskiest assumption, the one whose failure would make the rest irrelevant, and test it at the smallest informative scale. A 1M-parameter model on a single GPU can hit the same memory wall as a 70B model on a cluster, provided the experiment isolates that specific effect.
+
+\paragraph{Cultivate taste.}
+Metrics tell you what happened; taste tells you what to try next. You develop it through deliberate practice: predict an outcome, observe what actually happens, examine the gap. The Think First exercises are built around this loop, asking you to commit to an answer before reading ours, because that calibration is what separates experienced researchers from people who can only follow procedures.
+
+\paragraph{Don't overfit to the stack.}
+Model capabilities are improving fast enough that what counts as a valuable human skill shifts year to year. Two years ago writing Python was scarce; today models write it for you. In RL, a policy trained on a single environment collapses when the dynamics change, and engineering skills work the same way. Master current tools deeply, but extract the transferable reasoning about why systems behave the way they do, so you adapt when the next shift comes. If a specific exercise in this book has been overtaken by a more capable model, you should be able to formulate your own replacement.
+
+\subsection*{Who This Book Is For}
+
+This book is written for people who want to work at the intersection of systems engineering and machine learning research, regardless of which side they are coming from.
+
+You might be an ML researcher or research engineer who understands policy gradients but has never profiled a CUDA kernel. You want to know why your training run is slow and whether the answer is algorithmic or architectural.
+
+Or you might be a strong software engineer or systems programmer who wants to contribute to frontier AI research. You have the engineering instincts but not the ML background. You do not have a PhD and you do not need one.
+
+Both readers are held back by the same artificial boundary between ``systems person'' and ``research person.'' This book treats that boundary as a liability, not a specialization.
+
+\textit{Prerequisites.} We assume you are comfortable with Python and PyTorch, basic linear algebra, and how neural networks are trained. We assume you know what a transformer is, how autoregressive generation works, and what a policy and reward signal are at a conceptual level. We do not assume you know why rollout generation is the bottleneck, what makes a policy gradient estimator high-variance, or how to profile a CUDA kernel.
+
+\textit{Format.} This is a workbook, not a textbook. Think First exercises ask you to reason about a problem before reading the solution. Exercises are hands-on. Portfolio projects produce artifacts you can show to an employer or collaborator. Passive reading will not get you what this book offers.
 
 % --- RL Inference/Training Flywheel ---
+
+The following loop is the system this book teaches you to accelerate. Every chapter targets one edge of this cycle.
 
 \begin{center}
 \begin{tikzpicture}[
@@ -72,7 +99,7 @@ Every chapter in this book is evaluated against this metric. A kernel optimizati
 \end{tikzpicture}
 \end{center}
 
-The flywheel above is the core feedback loop. Faster rollout generation yields more rollouts per fixed compute budget, which produces lower-variance policy gradient estimates, which produces a smarter model. A smarter model is worth more to serve --- inference revenue funds the next round of compute, which funds further optimization of rollout generation. Every chapter in this book accelerates one edge of this cycle.
+The flywheel above is the core feedback loop. Faster rollout generation yields more rollouts per fixed compute budget, which produces lower-variance policy gradient estimates, which produces a smarter model. A smarter model is worth more to serve, and inference revenue funds the next round of compute, which funds further optimization of rollout generation. Every chapter in this book accelerates one edge of this cycle.
 
 \subsection*{Chapter Map}
 
@@ -94,6 +121,6 @@ Five content chapters form a linear pipeline. Each builds on the previous, and e
 \end{center}
 \medskip
 
-Chapter~1 establishes why inference is memory-bound, not compute-bound, on current hardware. Chapter~2 applies that understanding to individual kernels --- the building blocks. Chapter~3 composes kernels into a rollout generation system and optimizes end-to-end throughput. Chapter~4 steps back to understand the consumer of those rollouts: policy gradient algorithms, their variance properties, and what they actually need from the generation system. Chapter~5 wires everything together into a functioning RL training pipeline, closing the loop from hardware to learning signal.
+Chapter~1 establishes why inference is memory-bound, not compute-bound, on current hardware. Chapter~2 applies that understanding to individual kernels. Chapter~3 composes kernels into a rollout generation system and optimizes end-to-end throughput. Chapter~4 steps back to understand the consumer of those rollouts: policy gradient algorithms, their variance properties, and what they actually need from the generation system. Chapter~5 wires everything together into a functioning RL training pipeline, closing the loop from hardware to learning signal.
 
 The pipeline is linear, but the understanding is circular. After Chapter~5, you will read Chapter~1 differently.

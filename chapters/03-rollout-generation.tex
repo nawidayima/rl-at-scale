@@ -1,19 +1,20 @@
+% !TEX root = ../textbook.tex
 \section*{Rollout Generation at Scale}
 \addcontentsline{toc}{section}{3\quad Rollout Generation at Scale}
 
 \smallskip
 
 \begin{whythis}
-Dario Amodei put it plainly: ``This isn't a research problem. This is an engineering and inference problem.'' RLVR training runs last weeks, and 50--70\% of that wall time is spent on autoregressive token generation --- not on gradient computation, not on optimizer updates, but on the forward pass that produces rollouts. A $2\times$ speedup in generation throughput cuts your training time nearly in half.
+Dario Amodei put it plainly: ``This isn't a research problem. This is an engineering and inference problem.'' RLVR training runs last weeks, and 50--70\% of that wall time is spent on autoregressive token generation, not on gradient computation or optimizer updates, but on the forward pass that produces rollouts. A $2\times$ speedup in generation throughput cuts your training time nearly in half.
 
-Chapter~1 gave you the memory wall. Chapter~2 gave you the roofline model and kernel-level diagnosis. Now you compose kernels into a system: the rollout generation pipeline that feeds the RL training loop. The optimization target is not latency to a user. It is throughput --- total tokens per second per dollar --- under constraints that do not exist in user-facing serving. This distinction changes every design decision in the stack.
+Chapter~1 gave you the memory wall. Chapter~2 gave you the roofline model and kernel-level diagnosis. Now you compose kernels into a system: the rollout generation pipeline that feeds the RL training loop. The optimization target is not latency to a user. It is throughput (total tokens per second per dollar) under constraints that do not exist in user-facing serving. This distinction changes every design decision in the stack.
 \end{whythis}
 
 % =======================================================================
 \subsection*{Move 1: Rollout Generation Is Not User-Facing Serving}
 % =======================================================================
 
-User-facing inference optimizes \textbf{latency}: time-to-first-token (TTFT), time-per-output-token (TPOT), tail latency at P99. The workload is unpredictable --- diverse queries, variable context lengths, bursty traffic patterns. The system must handle any prompt at any time.
+User-facing inference optimizes \textbf{latency}: time-to-first-token (TTFT), time-per-output-token (TPOT), tail latency at P99. The workload is unpredictable: diverse queries, variable context lengths, bursty traffic patterns. The system must handle any prompt at any time.
 
 RL rollout generation optimizes \textbf{throughput}: total tokens generated per second per dollar. The workload is predictable: every query runs against the same model (the current policy), prompts come from a known training distribution, and no human is waiting for the response. Latency of any individual rollout is irrelevant; what matters is the rate at which \textit{batches} of rollouts complete so the training step can proceed.
 
@@ -46,7 +47,7 @@ The single-model constraint is the most exploitable. In user-facing serving, the
 \begin{thinkfirst}[Rollout-Specific Design]
 List three specific design decisions in an inference serving system that would change if you knew all queries came from the same model, used the same prompt distribution, and no human was waiting for the response.
 
-For each decision, state: (a) what the user-facing system does, (b) what the rollout system should do instead, and (c) what metric improves. Be concrete --- cite numbers from Chapters~1 and 2 where relevant (e.g., arithmetic intensity shifts from batching, bandwidth savings from prefix sharing).
+For each decision, state: (a) what the user-facing system does, (b) what the rollout system should do instead, and (c) what metric improves. Be concrete; cite numbers from Chapters~1 and 2 where relevant (e.g., arithmetic intensity shifts from batching, bandwidth savings from prefix sharing).
 \end{thinkfirst}
 
 % =======================================================================
@@ -66,7 +67,7 @@ Chapter~1 established that prefill and decode sit on opposite sides of the roofl
 
 Prefill and decode take comparable time in this regime, but use hardware differently. Running both on the same GPUs means the hardware is alternatively over-provisioned in compute (during decode) and in bandwidth (during prefill). Splitting them lets each phase use its hardware efficiently.
 
-\textbf{On-policy freshness: the deadline that does not exist in serving.} RL rollout generation has a constraint that user-facing serving lacks entirely: \textbf{on-policy freshness}. The RL algorithm (GRPO, PPO, REINFORCE) computes policy gradients from rollouts sampled under the \textit{current} policy $\pi_\theta$. As training proceeds, the policy updates: $\theta \to \theta'$. Rollouts generated under the old policy $\pi_\theta$ become stale --- the gradient computed from them is biased relative to the current policy.
+\textbf{On-policy freshness: the deadline that does not exist in serving.} RL rollout generation has a constraint that user-facing serving lacks entirely: \textbf{on-policy freshness}. The RL algorithm (GRPO, PPO, REINFORCE) computes policy gradients from rollouts sampled under the \textit{current} policy $\pi_\theta$. As training proceeds, the policy updates: $\theta \to \theta'$. Rollouts generated under the old policy $\pi_\theta$ become stale, and the gradient computed from them is biased relative to the current policy.
 
 Off-policy methods (PPO with importance sampling, for instance) can tolerate some staleness by reweighting, but the importance weights $\pi_{\theta'}(a|s) / \pi_\theta(a|s)$ increase in variance as the policies diverge. GRPO, which is on-policy, has zero tolerance for staleness: rollouts from the wrong policy produce incorrect advantage estimates.
 
@@ -88,21 +89,21 @@ RLVR training is not a single workload. It is a pipeline of three distinct compu
 \begin{enumerate}
   \item \textbf{Rollout generation (inference).} The policy generates $G$ completions per prompt (GRPO uses $G \sim 8$--$16$). This is memory-bandwidth-bound (Chapter~1). GPU utilization during generation: typically 30--60\%, even with batching.
   \item \textbf{Reward evaluation.} Each completion is scored by a reward model or verifier. This is a separate forward pass. If the reward model differs in architecture, it needs its own GPU partition or must time-share.
-  \item \textbf{Policy update (training).} Advantages are computed, and a gradient step is taken. This is compute-bound: large matrix multiplications in the backward pass. GPU utilization should be high --- if the batch is large enough.
+  \item \textbf{Policy update (training).} Advantages are computed, and a gradient step is taken. This is compute-bound: large matrix multiplications in the backward pass. GPU utilization should be high, provided the batch is large enough.
 \end{enumerate}
 
 The actor-learner architecture separates these phases onto dedicated hardware:
 
 \begin{itemize}
-  \item \textbf{Actors}: nodes dedicated to rollout generation. Optimized for inference throughput --- large batches, quantized weights, continuous batching.
-  \item \textbf{Learners}: nodes dedicated to gradient computation and weight updates. Optimized for training throughput --- full precision, FSDP or tensor parallelism, large effective batch size.
+  \item \textbf{Actors}: nodes dedicated to rollout generation. Optimized for inference throughput: large batches, quantized weights, continuous batching.
+  \item \textbf{Learners}: nodes dedicated to gradient computation and weight updates. Optimized for training throughput: full precision, FSDP or tensor parallelism, large effective batch size.
 \end{itemize}
 
-\textbf{The ratio question: how many actors per learner?} This is a capacity planning problem with a feedback loop. If actors outpace learners, rollouts queue up and go stale before the learner can consume them --- violating the on-policy freshness constraint from Move~2. If learners outpace actors, learners starve: expensive training hardware sits idle waiting for rollouts. The optimal ratio depends on the generation-to-training time ratio, which depends on model size, sequence length, $G$, and hardware.
+\textbf{The ratio question: how many actors per learner?} This is a capacity planning problem with a feedback loop. If actors outpace learners, rollouts queue up and go stale before the learner can consume them, violating the on-policy freshness constraint from Move~2. If learners outpace actors, learners starve: expensive training hardware sits idle waiting for rollouts. The optimal ratio depends on the generation-to-training time ratio, which depends on model size, sequence length, $G$, and hardware.
 
-\textbf{Variable-length outputs and the straggler problem.} Completions vary in length. A prompt that terminates early leaves its actor idle while others finish. The training step cannot begin until \textit{all} $G$ completions per prompt are done (needed for advantage normalization in GRPO). The slowest completion in the batch determines when training can start --- the classic straggler problem. As the number of actors $N$ grows, the probability that at least one has a slow completion increases, and the expected straggler delay grows as $O(\log N)$ for i.i.d.\ completion times.
+\textbf{Variable-length outputs and the straggler problem.} Completions vary in length. A prompt that terminates early leaves its actor idle while others finish. The training step cannot begin until \textit{all} $G$ completions per prompt are done (needed for advantage normalization in GRPO). The slowest completion in the batch determines when training can start. As the number of actors $N$ grows, the probability that at least one has a slow completion increases, and the expected straggler delay grows as $O(\log N)$ for i.i.d.\ completion times.
 
-\textbf{Pipelining: overlap generation and training.} The key optimization is to never let the learner wait. While the learner trains on batch $N$, actors generate batch $N+1$. This hides the generation latency behind training compute, provided generation is faster than or equal to training. When generation is the bottleneck (the common case --- 50--70\% of wall time), pipelining reduces but does not eliminate the bubble.
+\textbf{Pipelining: overlap generation and training.} The key optimization is to never let the learner wait. While the learner trains on batch $N$, actors generate batch $N+1$. This hides the generation latency behind training compute, provided generation is faster than or equal to training. When generation is the bottleneck (the common case, 50--70\% of wall time), pipelining reduces but does not eliminate the bubble.
 
 % === TikZ: Actor-Learner Pipeline Timeline ===
 
@@ -176,7 +177,7 @@ The actor-learner architecture separates these phases onto dedicated hardware:
 
 \textbf{Weight synchronization.} After the learner completes a gradient step, updated weights must be broadcast to all actors. This communication cost grows with model size and actor count. For a 70B model in BF16, the weight tensor is 140 GB. Broadcasting to $A$ actors over InfiniBand (400 Gb/s $= 50$ GB/s) takes $140/50 \approx 2.8$ seconds per actor (sequentially) or $\approx 2.8$ seconds total with a tree broadcast. This is dead time in which neither generation nor training is happening. Overlapping weight broadcast with the end of generation (actors finish their current rollouts while receiving new weights) is essential at scale.
 
-\textbf{Design heuristic.} Start with a 1:1 actor-to-learner ratio. Profile. If actors are the bottleneck (learner idle time $> 10\%$), add actors. If the learner is the bottleneck, reduce actors or increase the training batch size. The goal is to keep both sides saturated with zero idle time --- which in practice means keeping idle time below 5\%.
+\textbf{Design heuristic.} Start with a 1:1 actor-to-learner ratio. Profile. If actors are the bottleneck (learner idle time $> 10\%$), add actors. If the learner is the bottleneck, reduce actors or increase the training batch size. The goal is to keep both sides saturated with zero idle time, which in practice means keeping idle time below 5\%.
 
 % =======================================================================
 \subsection*{Move 4: The Optimization Toolkit}
@@ -190,7 +191,7 @@ With the system architecture established (actors generating rollouts, learners c
 
 RLVR rollout generation produces extreme length variance. A single GRPO step generates $G$ completions per prompt (typically $G = 8$--$32$) for each of $B$ prompts, producing $G \times B$ concurrent sequences. For reasoning models, sequence lengths follow a heavy-tailed distribution: many completions finish quickly (100--300 tokens for easy problems), while hard problems produce extended chains of thought (1000--4000 tokens). The ratio $\ell_{\max} / \ell_{\text{mean}}$ can exceed 10:1.
 
-\textbf{Static batching wastes compute.} The naive approach pads all sequences to the maximum length in the batch. For a batch where 90\% of sequences are 200 tokens and 10\% are 2000 tokens, static batching computes $10\times$ as many tokens as needed for the short sequences --- 90\% of GPU cycles in the tail are wasted on padding.
+\textbf{Static batching wastes compute.} The naive approach pads all sequences to the maximum length in the batch. For a batch where 90\% of sequences are 200 tokens and 10\% are 2000 tokens, static batching computes $10\times$ as many tokens as needed for the short sequences, and 90\% of GPU cycles in the tail are wasted on padding.
 
 \textbf{Continuous batching.} As one sequence finishes, a new one enters the batch immediately. The GPU stays busy with real work instead of padding. This is the core technique in vLLM, TGI, and similar serving systems.
 
@@ -238,7 +239,7 @@ $$\hat{A}_i = \frac{r_i - \mu_G}{\sigma_G}$$
 
 where $\mu_G$ and $\sigma_G$ are the mean and standard deviation of rewards within the group of $G$ completions. You cannot compute $\mu_G$ until all $G$ completions are finished. This creates a \textit{prompt group} abstraction: $G$ sequences that must be synchronized before training can begin.
 
-\textbf{Group-aware continuous batching.} The solution: batch \textit{across} prompt groups while maintaining per-group synchronization. When a completion finishes, its slot is immediately filled by a completion from a new prompt group. When all $G$ completions in a group finish, that group's advantages are computed and the group enters the training queue. Long-running groups coexist with short groups in the same batch. The key insight: you do not wait for all groups to finish --- only for each individual group. This gives continuous batching's throughput benefit while respecting GRPO's synchronization requirement.
+\textbf{Group-aware continuous batching.} The solution: batch \textit{across} prompt groups while maintaining per-group synchronization. When a completion finishes, its slot is immediately filled by a completion from a new prompt group. When all $G$ completions in a group finish, that group's advantages are computed and the group enters the training queue. Long-running groups coexist with short groups in the same batch. The key insight: you do not wait for all groups to finish, only for each individual group. This gives continuous batching's throughput benefit while respecting GRPO's synchronization requirement.
 
 % -----------------------------------------------------------------------
 \subsubsection*{Speculative Decoding}
@@ -272,7 +273,7 @@ $$K c_d + c_t < (K\alpha + 1) c_t \implies \frac{c_d}{c_t} < \alpha$$
 
 The breakeven condition: the acceptance rate $\alpha$ must exceed the cost ratio $c_d / c_t$. If the draft model is $10\times$ cheaper, speculative decoding helps for $\alpha > 0.1$.
 
-\textbf{RL-specific advantage: the draft model is free.} In user-facing serving, you need a separate distilled draft model. In RL training, the previous policy checkpoint is a natural draft model --- it already exists, requires no distillation, and approximates the current policy. The acceptance rate $\alpha$ depends on how much the policy shifted in $k$ gradient steps. Early in training (small updates), $\alpha$ is high and speculative decoding provides large speedups. Late in training (policy converging), $\alpha$ remains high because updates are small. The dangerous period is mid-training, where the policy changes rapidly.
+\textbf{RL-specific advantage: the draft model is free.} In user-facing serving, you need a separate distilled draft model. In RL training, the previous policy checkpoint is a natural draft model that already exists, requires no distillation, and approximates the current policy. The acceptance rate $\alpha$ depends on how much the policy shifted in $k$ gradient steps. Early in training (small updates), $\alpha$ is high and speculative decoding provides large speedups. Late in training (policy converging), $\alpha$ remains high because updates are small. The dangerous period is mid-training, where the policy changes rapidly.
 
 \textbf{The moving-target problem.} As the policy updates, the draft model (previous checkpoint) diverges from the target (current policy). Acceptance rate degrades monotonically with divergence. At some training step $t^*$, $\alpha$ falls below breakeven and speculative decoding stops helping. The practical question: how often must you refresh the draft checkpoint? This depends on learning rate, reward magnitude, and task difficulty. Measure $\alpha$ periodically during training. When it drops below $2 \times \alpha^*$ (a safety margin), refresh the draft.
 
@@ -288,7 +289,7 @@ In RL rollout generation, many rollouts share the same task prompt. GRPO generat
 
 $$\text{Prefix cache} = 2 \times 80 \times 64 \times 128 \times 2048 \times 2 \;\text{bytes} \approx 5.4 \;\text{GB}$$
 
-This is a one-time allocation per prompt group, versus $5.4 \times G$ GB without sharing. At $G = 16$, prefix sharing saves $\approx 81$ GB of KV-cache memory --- more than an entire H100's HBM.
+This is a one-time allocation per prompt group, versus $5.4 \times G$ GB without sharing. At $G = 16$, prefix sharing saves $\approx 81$ GB of KV-cache memory, more than an entire H100's HBM.
 
 \textbf{Implementation.} vLLM's prefix caching and SGLang's RadixAttention both support this pattern. The system detects common prefixes across requests and maps them to the same physical KV-cache blocks. For RL workloads where the sharing pattern is known in advance (same prompt, $G$ completions), the scheduler can be even simpler: explicitly share the prefix and fork $G$ decode streams.
 
@@ -298,7 +299,7 @@ This is a one-time allocation per prompt group, versus $5.4 \times G$ GB without
 
 Chapter~2 analyzed quantization kernel-by-kernel: the roofline shift from FP16 to INT4 doubles arithmetic intensity, moving decode closer to the compute-bound regime. Here the question is end-to-end: \textbf{does quantization improve policy improvement per dollar?}
 
-The mechanism is clear: quantized weights reduce bytes loaded per decode step, increasing throughput (tokens/second). The cost is generation quality degradation from quantization noise. In supervised serving, this tradeoff is straightforward --- measure perplexity, accept the degradation if it is small. In RL, the stakes are different.
+The mechanism is clear: quantized weights reduce bytes loaded per decode step, increasing throughput (tokens/second). The cost is generation quality degradation from quantization noise. In supervised serving, this tradeoff is straightforward: measure perplexity, accept the degradation if it is small. In RL, the stakes are different.
 
 The policy gradient is $\nabla_\theta \log \pi_\theta(a|s) \cdot \hat{A}$, where $\hat{A}$ is the advantage. Policy gradient estimates are inherently high-variance. Quantization noise adds an additional perturbation on top of this already-noisy estimator. The concern is that the failure mode is silent: training proceeds, rewards increase, but at a slower rate than full precision would achieve. Without a baseline to compare against, you would not know.
 
@@ -314,19 +315,19 @@ Mixture-of-Experts models replace the dense FFN with $E$ parallel expert FFNs, r
 
 \textbf{Load imbalance from narrow RL distributions.} In pretraining, the training distribution is broad (internet-scale text), and expert routing distributions are approximately stationary. In RL training on a specific task (math, code, reasoning), the prompt distribution is narrow. Some experts become disproportionately popular for the task, while others are underutilized. This creates dynamic load imbalance: GPUs holding hot experts are saturated while cold-expert GPUs are idle. The load-balancing auxiliary loss corrects for this over multiple gradient steps, but during the transition period, throughput drops.
 
-\textbf{Expert caching.} For a fixed prompt distribution, a small number of hot experts handle most tokens. Keeping hot experts in fast memory (HBM or L2) and evicting cold experts to CPU DRAM reduces effective all-to-all volume. Under RL training, the hot set shifts as the policy changes --- caching must adapt dynamically.
+\textbf{Expert caching.} For a fixed prompt distribution, a small number of hot experts handle most tokens. Keeping hot experts in fast memory (HBM or L2) and evicting cold experts to CPU DRAM reduces effective all-to-all volume. Under RL training, the hot set shifts as the policy changes, so caching must adapt dynamically.
 
 % =======================================================================
 \subsection*{Tensions}
 % =======================================================================
 
-Three tensions run through this chapter. Each has no universal answer --- the right point depends on your specific model, task, and hardware. The skill is knowing where the tension exists and measuring where the boundary falls.
+Three tensions run through this chapter. Each has no universal answer; the right point depends on your specific model, task, and hardware. The skill is knowing where the tension exists and measuring where the boundary falls.
 
 % --- Tension 1 ---
 
 \textbf{Tension 1: Batch size vs.\ on-policy freshness.}
 
-Larger batches amortize memory access costs. At batch size $B$, the weight-loading cost per token during decode is $\text{params} \times 2 / B$ bytes, versus the full weight load at $B = 1$. Doubling $B$ halves the per-token bandwidth cost. But larger batches take longer to generate, and the policy may have updated by the time the batch finishes --- making the rollouts stale.
+Larger batches amortize memory access costs. At batch size $B$, the weight-loading cost per token during decode is $\text{params} \times 2 / B$ bytes, versus the full weight load at $B = 1$. Doubling $B$ halves the per-token bandwidth cost. But larger batches take longer to generate, and the policy may have updated by the time the batch finishes, making the rollouts stale.
 
 The boundary: at what batch size does the staleness penalty (biased gradients, increased variance from importance-weight correction) outweigh the throughput benefit?
 
@@ -360,7 +361,7 @@ Design an experiment to measure where quantization degrades RL signal quality.
   \item Run GRPO training at three precision levels: BF16, INT8, INT4. Use the same hyperparameters for all three.
   \item For each precision level, log: (a) tokens generated per second, (b) reward variance within each GRPO group, (c) reward mean at each training step.
   \item Compute the effective metric: reward improvement per GPU-hour for each precision level.
-  \item If INT4 generates $2\times$ the tokens/second but achieves $0.7\times$ the reward improvement per step, the net efficiency is $1.4\times$ --- still a win. If it achieves $0.4\times$ per step, the net is $0.8\times$ --- a loss.
+  \item If INT4 generates $2\times$ the tokens/second but achieves $0.7\times$ the reward improvement per step, the net efficiency is $1.4\times$, still a win. If it achieves $0.4\times$ per step, the net is $0.8\times$, a loss.
 \end{enumerate}
 
 At what precision does the curve cross? Does the answer change between easy tasks (binary reward) and hard tasks (long chain-of-thought)?

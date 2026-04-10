@@ -11,11 +11,11 @@
 \usepackage{booktabs}
 \usepackage{xcolor}
 % --- Nippon Seasons palette (日本の伝統色) ---
-\definecolor{kitsune}{HTML}{C3803A}   % 狐色 fox — autumn
-\definecolor{aiiro}{HTML}{004C71}     % 藍色 indigo — winter
-\definecolor{beni}{HTML}{B14A4A}      % 紅 safflower — summer
-\definecolor{matcha}{HTML}{7B8B4E}    % 抹茶 tea — spring
-\definecolor{sumi}{HTML}{4A4A4A}      % 墨 ink — timeless
+\definecolor{kitsune}{HTML}{C3803A}   % 狐色 fox, autumn
+\definecolor{aiiro}{HTML}{004C71}     % 藍色 indigo, winter
+\definecolor{beni}{HTML}{B14A4A}      % 紅 crimson, summer
+\definecolor{matcha}{HTML}{7B8B4E}    % 抹茶 tea green, spring
+\definecolor{sumi}{HTML}{4A4A4A}      % 墨 ink
 % Colorblind-safe code syntax (Okabe-Ito derived)
 \definecolor{codekey}{HTML}{0077BB}
 \definecolor{codecomm}{HTML}{7F7F7F}
@@ -29,7 +29,7 @@
 
 % --- Workbook boxes ---
 
-% Exercise box (Kitsune — autumn warmth)
+% Exercise box: kitsune
 \newtcolorbox{exercise}[1][]{
   colback=kitsune!5!white, colframe=kitsune!80!black, boxrule=0.6pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
@@ -38,7 +38,7 @@
   phantom={\addcontentsline{toc}{subsection}{\texorpdfstring{\textit{Exercise: #1}}{Exercise: #1}}}
 }
 
-% Think-first box (Ai-iro — winter depth)
+% Think-first box: aiiro
 \newtcolorbox{thinkfirst}[1][]{
   colback=aiiro!5!white, colframe=aiiro!70!black, boxrule=0.5pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
@@ -47,7 +47,7 @@
   phantom={\addcontentsline{toc}{subsection}{\texorpdfstring{\textit{Think First: #1}}{Think First: #1}}}
 }
 
-% Portfolio project box (Beni — summer culmination)
+% Portfolio project box: beni
 \newtcolorbox{portfolio}[1][]{
   colback=beni!5!white, colframe=beni!80!black, boxrule=0.6pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
@@ -56,14 +56,14 @@
   phantom={\addcontentsline{toc}{subsection}{\texorpdfstring{\textbf{Portfolio: #1}}{Portfolio: #1}}}
 }
 
-% Why this matters box (Matcha — spring relevance)
+% Why-this-matters box: matcha
 \newtcolorbox{whythis}{
   colback=matcha!5!white, colframe=matcha!70!black, boxrule=0.5pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,
   fonttitle=\bfseries\small, title=Why This Matters at Frontier Scale
 }
 
-% Research taste box (Sumi — timeless ink)
+% Research taste box: sumi
 \newtcolorbox{taste}{
   colback=sumi!5!white, colframe=sumi!70!black, boxrule=0.5pt,
   left=5pt, right=5pt, top=3pt, bottom=3pt,

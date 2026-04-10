@@ -1,10 +1,11 @@
+% !TEX root = ../textbook.tex
 \section*{The Memory Wall \& Inference Architectures}
 \addcontentsline{toc}{section}{1\quad The Memory Wall \& Inference Architectures}
 
 \smallskip
 
 \begin{whythis}
-RLVR training is an inference workload in disguise. Generating rollouts --- autoregressive token sampling, one token at a time, loading the full weight matrix from DRAM at every step --- consumes 50--70\% of wall-clock time. The bottleneck is not compute. It is memory bandwidth: how fast you can move weights from off-chip memory to the arithmetic units.
+RLVR training is an inference workload in disguise. Generating rollouts consumes 50--70\% of wall-clock time, because each token requires loading the full weight matrix from DRAM. The bottleneck is not compute. It is memory bandwidth: how fast you can move weights from off-chip memory to the arithmetic units.
 
 Every inference chip designed in the last three years is a different answer to the same question: how do you move data faster, or avoid moving it at all? This chapter gives you the mental model to evaluate any chip announcement, any hardware procurement decision, and any architectural claim against first principles. The metric: policy improvement per dollar of rollout compute.
 \end{whythis}
@@ -17,17 +18,17 @@ One fact explains the entire inference hardware landscape.
 
 Gholami et al.\ (2024) quantified the divergence: compute performance has roughly tripled every two to three years. Off-chip memory bandwidth has improved by a factor of approximately $1.6\times$ over the same intervals. Compute scales exponentially. Memory bandwidth scales linearly. The gap between what the arithmetic units can consume and what the memory system can deliver widens with every generation.
 
-This is the memory wall. It is not a prediction --- it is a measured trend spanning four decades of semiconductor scaling. Everything that follows in this chapter is a consequence.
+This is the memory wall, a measured trend spanning four decades of semiconductor scaling. Everything that follows in this chapter is a consequence.
 
 \textbf{Prefill vs.\ decode: the two regimes.} Transformer inference has two distinct phases, and they sit on opposite sides of the roofline.
 
-\textit{Prefill} processes the entire input prompt in parallel. All tokens are known; the attention computation is a large batched matrix multiply. Arithmetic intensity is high --- $O(N)$ FLOPs per byte, where $N$ is sequence length. Prefill is \textbf{compute-bound}. More FLOP/s means faster prefill.
+\textit{Prefill} processes the entire input prompt in parallel. All tokens are known; the attention computation is a large batched matrix multiply. Arithmetic intensity is high, at $O(N)$ FLOPs per byte, where $N$ is sequence length. Prefill is \textbf{compute-bound}. More FLOP/s means faster prefill.
 
 \textit{Decode} generates one token at a time, sequentially. Each step loads the full weight matrix (billions of parameters $\times$ 2 bytes for BF16) from DRAM and performs a single matrix-vector product. Arithmetic intensity is approximately 1--2 FLOP/byte. Decode is \textbf{memory-bandwidth-bound}. More TB/s means faster decode.
 
 Every hardware design is a bet on which side of this split to optimize. Training-oriented chips maximize FLOP/s. Inference-oriented chips maximize bandwidth per dollar. The most interesting designs try to collapse the distinction entirely.
 
-\textbf{MoE as the extreme illustration.} Mixture-of-Experts models amplify the memory wall to its logical extreme. A 400B-parameter MoE with 8 experts and 2 active per token stores $8\times$ the weights but uses only $2\times$ the compute per forward pass. The ratio of parameters loaded from memory to FLOPs performed is $4\times$ worse than a dense model of the same active compute. MoE models are maximum memory pressure per FLOP of useful compute. Any chip that cannot move weights fast enough --- or hold enough of them on-chip --- pays an outsized penalty on MoE workloads.
+\textbf{MoE as the extreme illustration.} Mixture-of-Experts models amplify the memory wall to its logical extreme. A 400B-parameter MoE with 8 experts and 2 active per token stores $8\times$ the weights but uses only $2\times$ the compute per forward pass. The ratio of parameters loaded from memory to FLOPs performed is $4\times$ worse than a dense model of the same active compute. MoE models are maximum memory pressure per FLOP of useful compute. Any chip that cannot move weights fast enough, or hold enough of them on-chip, pays an outsized penalty on MoE workloads.
 
 \begin{thinkfirst}[The Decode Chip]
 Before reading further, consider: if you were designing a chip specifically for autoregressive decoding, what would you change about the memory system? What tradeoffs would you accept?
@@ -36,7 +37,7 @@ Think about:
 \begin{itemize}
   \item The arithmetic units are idle $>90\%$ of the time during decode, waiting for data. What if you made them smaller and spent the die area on something else?
   \item SRAM is $\sim$$5\times$ more expensive per byte than DRAM, but $\sim$$100\times$ faster. At what model size does the cost of putting all weights in SRAM become prohibitive?
-  \item If you could only optimize one number --- peak FLOP/s, memory bandwidth, or on-chip SRAM capacity --- which would reduce decode latency the most for a 70B model?
+  \item If you could only optimize one of peak FLOP/s, memory bandwidth, or on-chip SRAM capacity, which would reduce decode latency the most for a 70B model?
 \end{itemize}
 Write your answer before continuing. The five strategies below are five different answers to this question.
 \end{thinkfirst}
@@ -123,7 +124,7 @@ Write your answer before continuing. The five strategies below are five differen
 \subsection*{Move 2: Five Architectural Approaches to the Memory Wall}
 % =======================================================================
 
-These are not vendor categories. They are \textit{strategies} --- distinct engineering bets on how to solve the data movement problem. A single chip may combine elements of multiple strategies. The taxonomy is useful because it tells you what to ask about any new chip: which strategy is it pursuing, and what does it sacrifice?
+These are not vendor categories. They are \textit{strategies}, distinct engineering bets on how to solve the data movement problem. A single chip may combine elements of multiple strategies. The taxonomy is useful because it tells you what to ask about any new chip: which strategy is it pursuing, and what does it sacrifice?
 
 \medskip
 
@@ -167,7 +168,7 @@ The tradeoff is literal: wafer-scale manufacturing means every defect risks the 
 
 \textbf{Strategy 2: Smarter data movement.} Accept the memory wall's existence but move data across it as efficiently as possible. This is the GPU approach: large SRAM caches, hardware-managed prefetching, software-level kernel fusion, and tiling strategies that maximize data reuse in fast memory.
 
-Nvidia's Blackwell architecture exemplifies this. The B200 has approximately 500\,MB of aggregate on-chip SRAM across all SMs (L1/shared memory + L2 cache). It cannot hold the model, but aggressive kernel design --- FlashAttention, fused MLP kernels, continuous batching --- minimizes redundant DRAM accesses. The memory wall is not eliminated; it is managed through software sophistication.
+Nvidia's Blackwell architecture exemplifies this. The B200 has approximately 500\,MB of aggregate on-chip SRAM across all SMs (L1/shared memory + L2 cache). It cannot hold the model, but aggressive kernel design (FlashAttention, fused MLP kernels, continuous batching) minimizes redundant DRAM accesses. The memory wall is not eliminated; it is managed through software sophistication.
 
 The ceiling is SRAM size. No matter how clever the software, if the working set for a single decode step exceeds on-chip capacity, the kernel must go to DRAM. For large batch decode with long KV-caches, the working set grows with sequence length $\times$ batch size. Software optimization has diminishing returns as models and context windows grow.
 
@@ -185,17 +186,17 @@ The tradeoff is design complexity and the assumption that workload heterogeneity
 
 \textit{When it loses:} Homogeneous workloads where you would rather have a simpler, cheaper chip optimized for the dominant phase.
 
-\textbf{Strategy 4: In-memory computing.} The most radical approach: do not move data to compute --- compute where the data already lives. In-memory computing embeds arithmetic units directly in or adjacent to the memory arrays, performing multiply-accumulate operations without transferring weights across the memory bus.
+\textbf{Strategy 4: In-memory computing.} The most radical approach: do not move data to compute, but instead compute where the data already lives. In-memory computing embeds arithmetic units directly in or adjacent to the memory arrays, performing multiply-accumulate operations without transferring weights across the memory bus.
 
 d-Matrix builds digital in-memory compute chips where the weight matrix is stored in SRAM bitcells that double as multiply-accumulate units. A matrix-vector product is computed by activating a row of the memory array, with the computation happening as a side effect of the read operation.
 
-The tradeoff is manufacturing maturity and reprogrammability. Analog in-memory computing approaches (using memristors or ReRAM) promise even higher density but suffer from noise and limited precision. Digital approaches avoid the noise problem but sacrifice some of the density advantage. Both approaches make it difficult to update weights dynamically --- fine-tuning or LoRA adapters require rewriting the memory array, which is orders of magnitude slower than DRAM writes.
+The tradeoff is manufacturing maturity and reprogrammability. Analog in-memory computing approaches (using memristors or ReRAM) promise even higher density but suffer from noise and limited precision. Digital approaches avoid the noise problem but sacrifice some of the density advantage. Both approaches make it difficult to update weights dynamically, since fine-tuning or LoRA adapters require rewriting the memory array, which is orders of magnitude slower than DRAM writes.
 
 \textit{When it wins:} Inference-only deployments with fixed model weights, high volume, and extreme cost-per-token pressure.
 
-\textit{When it loses:} Any workload that requires frequent weight updates --- including RL training loops, where the model is updated every few hundred to few thousand steps.
+\textit{When it loses:} Any workload that requires frequent weight updates, including RL training loops, where the model is updated every few hundred to few thousand steps.
 
-\textbf{Strategy 5: Algorithm-specific hardware.} If you know exactly what computation the chip will perform, you can strip away all general-purpose overhead. No instruction decode, no branch prediction, no cache hierarchy --- just hardwired dataflow for one specific algorithm.
+\textbf{Strategy 5: Algorithm-specific hardware.} If you know exactly what computation the chip will perform, you can strip away all general-purpose overhead. No instruction decode, no branch prediction, no cache hierarchy, just hardwired dataflow for one specific algorithm.
 
 Etched's Sohu chip hardwires transformer inference: the attention pattern, the MLP structure, the layer norm, the residual connections are all fixed in silicon. CAS goes further, encoding model weights directly in the chip's wire routing at fabrication time.
 
@@ -208,7 +209,7 @@ The performance ceiling is extraordinary: no overhead means every transistor con
 \begin{taste}
 When you read about a new chip announcement, your first question should be: which of these five strategies is it pursuing? Your second: what does it sacrifice?
 
-The press release will emphasize the strategy's strengths. Your job is to identify the tradeoff. A chip that ``eliminates the memory wall'' with large SRAM --- at what model size does it stop fitting? A chip with ``10$\times$ better cost-per-token'' through algorithm-specific hardware --- what happens when the architecture changes? A chip with ``breakthrough in-memory computing'' --- can you fine-tune on it?
+The press release will emphasize the strategy's strengths. Your job is to identify the tradeoff. A chip that ``eliminates the memory wall'' with large SRAM: at what model size does it stop fitting? A chip with ``10$\times$ better cost-per-token'' through algorithm-specific hardware: what happens when the architecture changes? A chip with ``breakthrough in-memory computing'': can you fine-tune on it?
 
 The strategies are not ranked. Each wins under different conditions. The skill is matching the strategy to the workload.
 \end{taste}
@@ -217,14 +218,14 @@ The strategies are not ranked. Each wins under different conditions. The skill i
 \subsection*{Move 3: Decision-Grade Benchmarking on Unfamiliar Hardware}
 % =======================================================================
 
-Reading spec sheets tells you what a chip \textit{could} do. Benchmarking tells you what it \textit{does} do on your workload. The gap between these two numbers --- the utilization gap --- is where engineering effort lives.
+Reading spec sheets tells you what a chip \textit{could} do. Benchmarking tells you what it \textit{does} do on your workload. The gap between these two numbers is where engineering effort lives.
 
 This section provides a hardware-agnostic benchmarking template. The template is the repeatable skill; the two exercise instances that follow are applications of it.
 
 \textbf{The template: six steps from spec sheet to procurement decision.}
 
 \begin{enumerate}
-  \item \textbf{Identify peak specs.} Find the hardware's theoretical peak compute (FLOP/s at your target precision) and peak memory bandwidth (TB/s). These are the roofline ceilings. If the vendor does not publish both numbers, that is information --- they are hiding the weaker metric.
+  \item \textbf{Identify peak specs.} Find the hardware's theoretical peak compute (FLOP/s at your target precision) and peak memory bandwidth (TB/s). These are the roofline ceilings. If the vendor does not publish both numbers, that tells you something: they are hiding the weaker metric.
 
   \item \textbf{Calculate the roofline ridge point.} The ridge point is peak compute divided by peak bandwidth:
   $$I^* = \frac{\text{Peak FLOP/s}}{\text{Peak Bandwidth (B/s)}}$$
@@ -239,7 +240,7 @@ This section provides a hardware-agnostic benchmarking template. The template is
 
   \item \textbf{Measure actual throughput.} Run the workload. Measure tokens/second at target batch sizes. Compute achieved bandwidth: bytes loaded per second = (model size in bytes) $\times$ (tokens/second / batch size). Compare achieved bandwidth to peak bandwidth. The ratio is your bandwidth utilization.
 
-  \item \textbf{Compute cost-per-token.} Divide hourly hardware cost by measured tokens per second. This is the number that determines procurement decisions, not FLOP/s, not bandwidth, not peak anything --- cost per useful output token.
+  \item \textbf{Compute cost-per-token.} Divide hourly hardware cost by measured tokens per second. This is the number that determines procurement decisions, not FLOP/s, not bandwidth, not peak anything, but cost per useful output token.
 
   \item \textbf{Produce a one-page comparison.} Against a reference platform (typically H100 SXM), show: peak specs, ridge point, predicted regime, measured throughput, utilization, and cost-per-token. One table, one roofline plot, one recommendation sentence.
 \end{enumerate}
@@ -249,7 +250,7 @@ The template is designed to take 4--8 hours per platform for a practitioner with
 \medskip
 
 \begin{exercise}[AMD MI300X Benchmarking]
-\textbf{Hypothesis:} MI300X has 5.3\,TB/s HBM3 bandwidth vs.\ H100's 3.35\,TB/s --- a $1.58\times$ advantage. For memory-bandwidth-bound decode, this should translate to approximately $1.58\times$ generation throughput.
+\textbf{Hypothesis:} MI300X has 5.3\,TB/s HBM3 bandwidth vs.\ H100's 3.35\,TB/s, a $1.58\times$ advantage. For memory-bandwidth-bound decode, this should translate to approximately $1.58\times$ generation throughput.
 
 \textbf{Apply the template:}
 
@@ -274,7 +275,7 @@ MI300X becomes compute-bound at lower arithmetic intensity. For intermediate int
   \item Ratio vs.\ H100 baseline (use published vLLM benchmarks or your own measurements).
 \end{itemize}
 
-\textbf{Diagnostic:} If the measured speedup is $<1.3\times$, the gap is not in HBM bandwidth --- it is in software. Profile with \texttt{omniperf} to identify whether the bottleneck is attention kernel efficiency, RCCL initialization overhead, or KV-cache management. The MI300X has 8 XCDs connected via Infinity Fabric; inter-XCD communication for KV-cache sharding can erase the bandwidth advantage if the attention kernel does not account for the topology.
+\textbf{Diagnostic:} If the measured speedup is $<1.3\times$, the gap is not in HBM bandwidth but in software. Profile with \texttt{omniperf} to identify whether the bottleneck is attention kernel efficiency, RCCL initialization overhead, or KV-cache management. The MI300X has 8 XCDs connected via Infinity Fabric; inter-XCD communication for KV-cache sharding can erase the bandwidth advantage if the attention kernel does not account for the topology.
 
 \textbf{Record:} Roofline plot with both chips, measured throughput table, utilization percentages, cost-per-token comparison, one-paragraph recommendation.
 \end{exercise}

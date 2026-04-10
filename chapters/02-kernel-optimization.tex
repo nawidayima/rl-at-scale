@@ -1,12 +1,13 @@
+% !TEX root = ../textbook.tex
 \section*{Kernel Optimization for Inference}
 \addcontentsline{toc}{section}{2\quad Kernel Optimization for Inference}
 
 \smallskip
 
 \begin{whythis}
-Chapter~1 established the memory wall as the governing constraint on inference hardware. This chapter makes it operational. The roofline model becomes a diagnostic tool applied to specific kernels --- attention, quantized matmuls, MoE routing --- with concrete numbers on concrete hardware. The question shifts from ``why is decode slow?'' to ``which kernel is the bottleneck, what regime is it in, and what optimization moves it to a faster regime?''
+Chapter~1 established the memory wall as the governing constraint on inference hardware. This chapter makes it operational. The roofline model becomes a diagnostic tool applied to specific kernels (attention, quantized matmuls, MoE routing) with concrete numbers on concrete hardware. The question shifts from ``why is decode slow?'' to ``which kernel is the bottleneck, what regime is it in, and what optimization moves it to a faster regime?''
 
-Three to five kernels dominate RLVR wall time. Each sits at a specific point on the roofline. Optimizing the wrong kernel --- or optimizing the right kernel for the wrong bottleneck --- wastes engineering weeks. The skill this chapter builds: diagnose first, optimize second, verify third. The tool: the roofline model, applied with numbers.
+Three to five kernels dominate RLVR wall time. Each sits at a specific point on the roofline. Optimizing the wrong kernel, or the right kernel for the wrong bottleneck, wastes engineering weeks. The skill this chapter builds: diagnose first, optimize second, verify third. The tool: the roofline model, applied with numbers.
 \end{whythis}
 
 % =======================================================================
@@ -24,9 +25,9 @@ $$I^* = \frac{\text{peak compute (FLOP/s)}}{\text{peak bandwidth (B/s)}}$$
 If $I < I^*$, the kernel is \textbf{memory-bound}: performance scales with bandwidth. If $I > I^*$, the kernel is \textbf{compute-bound}: performance scales with FLOP/s. The attainable throughput is:
 $$\text{Throughput} = \min\left(\text{peak FLOP/s},\;\; I \times \text{peak bandwidth}\right)$$
 
-This is a ceiling, not a guarantee. Real kernels hit 50--80\% of the roofline ceiling. The gap comes from imperfect tiling, bank conflicts, uncoalesced memory accesses, and pipeline bubbles. But the roofline tells you which ceiling you are hitting --- and therefore which class of optimization can help.
+This is a ceiling, not a guarantee. Real kernels hit 50--80\% of the roofline ceiling. The gap comes from imperfect tiling, bank conflicts, uncoalesced memory accesses, and pipeline bubbles. But the roofline tells you which ceiling you are hitting, and therefore which class of optimization can help.
 
-\textbf{Key insight: the same kernel, different regimes.} A batched matrix multiply at batch size 1 has arithmetic intensity $\approx 1$ FLOP/byte (BF16). At batch size 64, intensity rises to $\approx 32$ FLOP/byte. On an H100 with ridge point $\approx 148$ FLOP/byte, both are memory-bound. On a chip with ridge point $\approx 30$ FLOP/byte, batch-64 is compute-bound while batch-1 is memory-bound. The optimization strategy differs completely --- and you cannot know which applies without computing the numbers for your specific hardware.
+\textbf{Key insight: the same kernel, different regimes.} A batched matrix multiply at batch size 1 has arithmetic intensity $\approx 1$ FLOP/byte (BF16). At batch size 64, intensity rises to $\approx 32$ FLOP/byte. On an H100 with ridge point $\approx 148$ FLOP/byte, both are memory-bound. On a chip with ridge point $\approx 30$ FLOP/byte, batch-64 is compute-bound while batch-1 is memory-bound. The optimization strategy differs completely, and you cannot know which applies without computing the numbers for your specific hardware.
 
 \textbf{Reference hardware.} We use two chips throughout this chapter for concrete examples:
 
@@ -55,7 +56,7 @@ At each decode step, the query is a single vector of dimension $d$ per head. The
 
 Arithmetic intensity per head $\approx 4dS / 4dS = 1$ FLOP/byte.
 
-On a chip with 1000 TFLOP/s peak compute and 3 TB/s bandwidth, the ridge point is $\approx 333$ FLOP/byte. At intensity 1, this is deep in the memory-bound regime --- throughput is $1 \times 3 \times 10^{12} = 3$ TFLOP/s, using 0.3\% of peak compute.
+On a chip with 1000 TFLOP/s peak compute and 3 TB/s bandwidth, the ridge point is $\approx 333$ FLOP/byte. At intensity 1, this is deep in the memory-bound regime, where throughput is $1 \times 3 \times 10^{12} = 3$ TFLOP/s, using 0.3\% of peak compute.
 
 This is why autoregressive decode is the bottleneck: the arithmetic units are idle $>99\%$ of the time, waiting for data. No amount of faster compute fixes this. Only bandwidth or data movement reduction helps.
 \end{thinkfirst}
@@ -146,7 +147,7 @@ This is why autoregressive decode is the bottleneck: the arithmetic units are id
 
 \textbf{Reading the diagram.} Two operations produce the same measured TFLOP/s but for different reasons: AR decode at batch=1 hits the bandwidth ceiling at low intensity; prefill attention hits the compute ceiling at high intensity. The optimization for each is completely different. For decode, reduce bytes moved (quantization, KV-cache compression). For prefill, increase compute efficiency (larger tiles, better MXU/Tensor Core utilization). Applying the wrong optimization wastes engineering time.
 
-\textbf{Quantization shifts the x-axis.} Moving weights from FP16 (2 bytes) to INT4 (0.5 bytes) reduces bytes loaded by $4\times$ without changing FLOPs. Arithmetic intensity quadruples. This is the primary mechanism by which quantization accelerates memory-bound kernels --- it is a bandwidth optimization, not a compute optimization. The FP4 compute throughput increase on Blackwell is a secondary benefit.
+\textbf{Quantization shifts the x-axis.} Moving weights from FP16 (2 bytes) to INT4 (0.5 bytes) reduces bytes loaded by $4\times$ without changing FLOPs. Arithmetic intensity quadruples. This is the primary mechanism by which quantization accelerates memory-bound kernels because it is a bandwidth optimization, not a compute optimization. The FP4 compute throughput increase on Blackwell is a secondary benefit.
 
 \textbf{Batching shifts the x-axis.} At batch size $B$, the weight matrix is loaded once and used for $B$ matrix-vector products. Arithmetic intensity scales linearly with $B$. This is why continuous batching (Chapter~3) matters: higher effective batch size moves decode closer to the ridge point.
 
@@ -160,19 +161,19 @@ The kernels that dominate RLVR inference wall time fall into three categories: a
 \subsubsection*{2a: Attention Kernels}
 % -----------------------------------------------------------------------
 
-\textbf{Why naive attention is unacceptable.} Standard attention computes $O = \text{softmax}(QK^\top\!/\!\sqrt{d})\,V$. For sequence length~$N$ and head dimension~$d$, the intermediate score matrix $QK^\top$ is $N \times N$. Materializing it in DRAM costs $O(N^2)$ bytes. At $N{=}8192$ in FP16: 128\,MB per head, per layer. A 32-head, 32-layer model needs ${\sim}130$\,GB of intermediate storage --- exceeding a single H100's HBM.
+\textbf{Why naive attention is unacceptable.} Standard attention computes $O = \text{softmax}(QK^\top\!/\!\sqrt{d})\,V$. For sequence length~$N$ and head dimension~$d$, the intermediate score matrix $QK^\top$ is $N \times N$. Materializing it in DRAM costs $O(N^2)$ bytes. At $N{=}8192$ in FP16: 128\,MB per head, per layer. A 32-head, 32-layer model needs ${\sim}130$\,GB of intermediate storage, exceeding a single H100's HBM.
 
 The problem is not the FLOPs (attention is $O(N^2 d)$). The problem is materializing the $N^2$ matrix in DRAM, reading it back for softmax, then reading it again for the value projection. Three passes over $O(N^2)$ data when DRAM bandwidth is the bottleneck.
 
-\textbf{FlashAttention: fuse everything, materialize nothing.} FlashAttention processes $Q$, $K$, $V$ in tiles that fit in SRAM. For each tile of queries, it streams through all key-value tiles, computing attention scores and accumulating the output --- without ever writing the full $N \times N$ matrix to DRAM.
+\textbf{FlashAttention: fuse everything, materialize nothing.} FlashAttention processes $Q$, $K$, $V$ in tiles that fit in SRAM. For each tile of queries, it streams through all key-value tiles, computing attention scores and accumulating the output without ever writing the full $N \times N$ matrix to DRAM.
 
-The key algorithmic insight is the \textit{online softmax}: standard softmax requires a full pass to find the maximum (for numerical stability), then a second pass to exponentiate and normalize. The online algorithm maintains running statistics $(m, \ell)$ --- current maximum and current sum --- updating both as new tiles arrive. This enables single-pass softmax over blocks that never coexist in SRAM simultaneously.
+The key algorithmic insight is the \textit{online softmax}: standard softmax requires a full pass to find the maximum (for numerical stability), then a second pass to exponentiate and normalize. The online algorithm maintains running statistics $(m, \ell)$, the current maximum and current sum, updating both as new tiles arrive. This enables single-pass softmax over blocks that never coexist in SRAM simultaneously.
 
-HBM traffic drops from $\Theta(N^2 + Nd)$ (standard) to $\Theta(Nd)$ (FlashAttention) --- linear in sequence length. At $N = 8192$ and $d = 128$, this is a $64\times$ reduction in memory traffic. The compute is identical; only the data movement changes. This is a pure memory-hierarchy optimization.
+HBM traffic drops from $\Theta(N^2 + Nd)$ (standard) to $\Theta(Nd)$ (FlashAttention), linear in sequence length. At $N = 8192$ and $d = 128$, this is a $64\times$ reduction in memory traffic. The compute is identical; only the data movement changes. This is a pure memory-hierarchy optimization.
 
 \textbf{Decode vs.\ prefill: two regimes, one kernel.} The same attention operation sits in different roofline regimes depending on context:
 
-\textit{Prefill} processes the full input sequence in parallel. $Q$, $K$, $V$ are all $[N \times d]$ matrices. The attention computation is a batched matmul with arithmetic intensity $O(N/d)$. At $N = 4096$ and $d = 128$, intensity $\approx 32$ FLOP/byte --- approaching compute-bound on some hardware.
+\textit{Prefill} processes the full input sequence in parallel. $Q$, $K$, $V$ are all $[N \times d]$ matrices. The attention computation is a batched matmul with arithmetic intensity $O(N/d)$. At $N = 4096$ and $d = 128$, intensity $\approx 32$ FLOP/byte, approaching compute-bound on some hardware.
 
 \textit{Decode} generates one token at a time. $Q$ is $[1 \times d]$; the kernel reads the full KV-cache ($[S \times d]$ for each of $K$ and $V$, where $S$ is the current sequence length). This is a matrix-vector product: arithmetic intensity $\approx 1$ FLOP/byte, deep in the memory-bound regime regardless of hardware. Decode attention is the single most bandwidth-hungry operation in autoregressive generation.
 
@@ -180,9 +181,9 @@ The engineering consequence: decode attention benefits from bandwidth optimizati
 
 \textbf{Paged attention for KV-cache.} Naive KV-cache allocation reserves a contiguous memory block per sequence at the maximum context length. For RLVR rollouts with high length variance (100--4000 tokens), this wastes memory proportional to the gap between actual and maximum length.
 
-Paged attention (vLLM) manages KV-cache as fixed-size blocks allocated on demand and mapped to non-contiguous physical memory --- analogous to OS virtual memory pages. Fragmentation drops from $O(S_{\max})$ to $O(\text{block size})$ per sequence. This directly increases the number of concurrent rollouts that fit in HBM, which increases effective batch size, which moves decode attention rightward on the roofline.
+Paged attention (vLLM) manages KV-cache as fixed-size blocks allocated on demand and mapped to non-contiguous physical memory, analogous to OS virtual memory pages. Fragmentation drops from $O(S_{\max})$ to $O(\text{block size})$ per sequence. This directly increases the number of concurrent rollouts that fit in HBM, which increases effective batch size, which moves decode attention rightward on the roofline.
 
-\textbf{KV-cache quantization.} FP8 or INT8 quantization of the KV-cache reduces memory by $2\times$ (from FP16) and bytes loaded per decode step by the same factor. The arithmetic intensity of decode attention doubles. For RLVR, this requires caution: KV-cache quantization introduces noise in attention scores, which propagates to generation quality, which directly affects the reward signal and gradient estimates. Unlike supervised training where a small quality degradation is tolerable, RL amplifies distributional shifts --- a 2\% quality drop may produce a disproportionate change in the reward distribution, leading to noisier advantage estimates and slower policy improvement. Measure reward variance, not just perplexity, before deploying KV-cache quantization in an RL pipeline.
+\textbf{KV-cache quantization.} FP8 or INT8 quantization of the KV-cache reduces memory by $2\times$ (from FP16) and bytes loaded per decode step by the same factor. The arithmetic intensity of decode attention doubles. For RLVR, this requires caution: KV-cache quantization introduces noise in attention scores, which propagates to generation quality, which directly affects the reward signal and gradient estimates. Unlike supervised training where a small quality degradation is tolerable, RL amplifies distributional shifts, so a 2\% quality drop may produce a disproportionate change in the reward distribution, leading to noisier advantage estimates and slower policy improvement. Measure reward variance, not just perplexity, before deploying KV-cache quantization in an RL pipeline.
 
 \begin{exercise}[FlashAttention Roofline Profiling]
 Profile FlashAttention decode latency across batch sizes 1, 8, 32, 64. For each batch size, compute:
@@ -192,16 +193,16 @@ Profile FlashAttention decode latency across batch sizes 1, 8, 32, 64. For each 
   \item Attainable TFLOP/s from the roofline model.
 \end{itemize}
 
-Plot all four points on the roofline diagram for your hardware. Identify the crossover batch size where decode transitions from memory-bound to compute-bound. On H100 (ridge $\approx 148$ FLOP/byte), expect this crossover to be unreachable at practical batch sizes --- verify.
+Plot all four points on the roofline diagram for your hardware. Identify the crossover batch size where decode transitions from memory-bound to compute-bound. On H100 (ridge $\approx 148$ FLOP/byte), expect this crossover to be unreachable at practical batch sizes. Verify this.
 
-Use a 7B model, sequence length 2048, FP16. Warm up 10 iterations, measure 100, report median. If achieved bandwidth is below 60\% of peak at batch size 1, profile memory access patterns --- non-coalesced KV-cache reads from paged attention can cause this.
+Use a 7B model, sequence length 2048, FP16. Warm up 10 iterations, measure 100, report median. If achieved bandwidth is below 60\% of peak at batch size 1, profile memory access patterns; non-coalesced KV-cache reads from paged attention can cause this.
 \end{exercise}
 
 % -----------------------------------------------------------------------
 \subsubsection*{2b: Quantized Matmuls}
 % -----------------------------------------------------------------------
 
-During autoregressive decode, the weight matmul loads the full parameter matrix from DRAM at every step: for a 7B model in BF16, that is $\sim$14\,GB per step. At H100's 3.35\,TB/s, the minimum time per step is $14 / 3350 \approx 4.2$\,ms --- just from weight loading. This sets a hard floor on decode latency that no compute optimization can break.
+During autoregressive decode, the weight matmul loads the full parameter matrix from DRAM at every step: for a 7B model in BF16, that is $\sim$14\,GB per step. At H100's 3.35\,TB/s, the minimum time per step is $14 / 3350 \approx 4.2$\,ms, just from weight loading. This sets a hard floor on decode latency that no compute optimization can break.
 
 \textbf{Weight-only quantization.} Reducing weight precision from FP16 to INT8 halves the bytes loaded: 7\,GB per step, minimum latency $\approx 2.1$\,ms. INT4 quarters it: 3.5\,GB, minimum $\approx 1.0$\,ms. The FLOPs are unchanged (dequantization to FP16/FP32 for the actual multiply-accumulate is negligible), but the bandwidth requirement halves or quarters. This is the mechanism: quantization is a bandwidth optimization for memory-bound kernels.
 
@@ -223,11 +224,11 @@ FP4   & 0.5 & $1.5N^2$ bytes & $4N/3$ & compute ($I = 5461$) \\
 \smallskip
 For large square GEMMs (training), all precisions are compute-bound on H100. The benefit of lower precision is more FLOP/s from the Tensor Cores, not less bandwidth.
 
-For decode (effective $N \approx \text{batch size} \times d$, typically $\ll 4096$): all precisions are memory-bound. The benefit of lower precision is fewer bytes loaded --- a bandwidth optimization.
+For decode (effective $N \approx \text{batch size} \times d$, typically $\ll 4096$): all precisions are memory-bound. The benefit of lower precision is fewer bytes loaded, which is a bandwidth optimization.
 
 \textbf{FP4 on Blackwell.} Blackwell's B200 offers $\sim$18,000 TFLOP/s at FP4 with 8\,TB/s bandwidth. Ridge point: $18000 / 8 = 2250$ FLOP/byte. For a decode-step weight matmul at batch size 1 with FP4 weights: intensity $\approx 2$ FLOP/byte. Still deep in the memory-bound regime. Even Blackwell's enormous FP4 compute advantage does not change this: at batch size 1, the weight load dominates regardless of precision. The 8\,TB/s bandwidth is what matters, not the 18,000 TFLOP/s.
 
-\textbf{The RL tension.} Quantization makes rollouts cheaper but noisier. The critical question for RLVR is not ``does quantization degrade perplexity?'' --- it is ``does quantization degrade the reward signal enough to slow policy learning?'' These are different measurements. RL amplifies small distributional shifts: a quantized model that generates slightly different token distributions produces different reward statistics, which produce different advantage estimates, which produce different gradients. A 2\% perplexity degradation might be invisible in supervised evaluation but produce measurably higher gradient variance in RLVR.
+\textbf{The RL tension.} Quantization makes rollouts cheaper but noisier. The critical question for RLVR is not ``does quantization degrade perplexity?'' but ``does quantization degrade the reward signal enough to slow policy learning?'' These are different measurements. RL amplifies small distributional shifts: a quantized model that generates slightly different token distributions produces different reward statistics, which produce different advantage estimates, which produce different gradients. A 2\% perplexity degradation might be invisible in supervised evaluation but produce measurably higher gradient variance in RLVR.
 
 The practical protocol: run a short RL training ablation (100--500 gradient steps) comparing FP16 and quantized rollout generation. Compare reward curves, gradient norm variance, and KL divergence from the reference policy. If gradient variance increases by $>20\%$ under quantization, the cheaper rollouts are costing you convergence speed.
 
@@ -237,7 +238,7 @@ If you quantize model weights from FP16 to INT4 and rollout quality degrades by 
 The eval benchmark measures generation quality on a fixed distribution. RL training cares about the reward signal's informativeness for policy improvement. Consider:
 \begin{itemize}
   \item Does the 2\% quality drop change which rollouts receive high vs.\ low rewards? If the reward model assigns similar scores to FP16 and INT4 outputs, the advantage estimates are similar and quantization is fine.
-  \item Does the distributional shift from quantization interact with the reward function? For binary rewards (correct/incorrect on math problems), a small quality drop may flip some borderline problems from correct to incorrect --- changing the reward signal discontinuously.
+  \item Does the distributional shift from quantization interact with the reward function? For binary rewards (correct/incorrect on math problems), a small quality drop may flip some borderline problems from correct to incorrect, changing the reward signal discontinuously.
   \item Does the gradient variance increase? Even if mean reward is similar, higher variance in the advantage estimates slows convergence.
   \item Does the KL divergence between the quantized policy and the reference policy differ from the FP16 case? GRPO penalizes KL divergence; quantization-induced distributional shift adds an uncontrolled source of KL that may interact with the KL penalty.
 \end{itemize}
@@ -256,7 +257,7 @@ Mixture-of-Experts models replace the dense FFN with $E$ parallel expert FFNs, r
 \begin{enumerate}
   \item \textbf{Route:} compute $[B \times E]$ gating scores, select top-$k$ per row. Compute-cheap, memory-cheap.
   \item \textbf{Dispatch:} gather tokens into per-expert batches. Each expert receives a variable number of tokens. This is an irregular scatter operation.
-  \item \textbf{Compute:} run $k$ expert FFNs. Each expert's batch size varies --- some experts may receive many tokens, others few or none.
+  \item \textbf{Compute:} run $k$ expert FFNs. Each expert's batch size varies: some experts may receive many tokens, others few or none.
   \item \textbf{Combine:} scatter expert outputs back to the original token positions and combine (weighted sum by gating scores).
 \end{enumerate}
 
@@ -264,7 +265,7 @@ Mixture-of-Experts models replace the dense FFN with $E$ parallel expert FFNs, r
 
 \textbf{Expert parallelism.} When experts are distributed across GPUs (each GPU holds $E / \text{num\_gpus}$ experts), every MoE layer requires all-to-all communication: tokens must be sent to the GPU holding their selected expert, processed, and sent back. For a model with $L/2$ MoE layers (alternating dense and MoE), this is $L$ all-to-all operations per autoregressive step. At large batch sizes, this communication can dominate step latency.
 
-\textbf{Sparse dispatch kernels.} The gather-compute-scatter pattern is challenging to implement efficiently. Naive implementations use \texttt{torch.index\_select} for gathering and \texttt{scatter\_add} for combining --- each a separate kernel launch with its own DRAM round-trip. Expert batch sizes are irregular: the GEMM for an expert receiving 3 tokens is a very different shape from one receiving 300 tokens. Padding to a uniform expert batch size wastes compute; dynamic-shape GEMMs underutilize Tensor Cores at small sizes.
+\textbf{Sparse dispatch kernels.} The gather-compute-scatter pattern is challenging to implement efficiently. Naive implementations use \texttt{torch.index\_select} for gathering and \texttt{scatter\_add} for combining, each a separate kernel launch with its own DRAM round-trip. Expert batch sizes are irregular: the GEMM for an expert receiving 3 tokens is a very different shape from one receiving 300 tokens. Padding to a uniform expert batch size wastes compute; dynamic-shape GEMMs underutilize Tensor Cores at small sizes.
 
 \textbf{Roofline position.} MoE forward passes have lower \textit{effective} arithmetic intensity than their theoretical intensity suggests. The theoretical intensity accounts for $k$ expert FFNs, each performing standard GEMMs. The effective intensity is reduced by: dispatch overhead (irregular memory accesses for token gathering), load imbalance (idle experts waste allocated compute), and communication overhead (all-to-all for expert parallelism). On the roofline diagram, MoE operations plot below and to the left of where a dense model with the same active parameter count would sit.
 
@@ -274,7 +275,7 @@ Mixture-of-Experts models replace the dense FFN with $E$ parallel expert FFNs, r
 
 The optimization principles from Move~2 apply to every accelerator. The specific APIs and hardware abstractions differ, but the diagnostic thinking is identical: find the bottleneck on the roofline, optimize data movement, overlap compute and memory access. This section maps the concepts between GPU (CUDA) and TPU (Pallas/XLA) to make the universality concrete.
 
-\textbf{GPU: threads and memory access patterns.} On a GPU, thousands of lightweight threads execute the same instruction on different data (SIMT). The programmer manages \textit{shared memory} --- fast on-chip SRAM visible to all threads in a thread block. The optimization loop:
+\textbf{GPU: threads and memory access patterns.} On a GPU, thousands of lightweight threads execute the same instruction on different data (SIMT). The programmer manages \textit{shared memory}, fast on-chip SRAM visible to all threads in a thread block. The optimization loop:
 \begin{enumerate}
   \item Tile the computation so each thread block's working set fits in shared memory.
   \item Load tiles from HBM to shared memory with coalesced accesses (consecutive threads access consecutive addresses).
@@ -282,7 +283,7 @@ The optimization principles from Move~2 apply to every accelerator. The specific
   \item Use warp-level primitives (\texttt{mma.sync}, shuffle instructions) to coordinate within a 32-thread warp without shared memory round-trips.
 \end{enumerate}
 
-\textbf{TPU: pipeline efficiency and keeping the systolic array fed.} On a TPU, a 128$\times$128 systolic array (MXU) flows data through in a deterministic pattern. There is no warp scheduling randomness. The programmer manages \textit{VMEM} --- on-chip SRAM ($\sim$30\,MB on v5e) --- and \textit{DMA transfers} between HBM and VMEM. The optimization loop:
+\textbf{TPU: pipeline efficiency and keeping the systolic array fed.} On a TPU, a 128$\times$128 systolic array (MXU) flows data through in a deterministic pattern. There is no warp scheduling randomness. The programmer manages \textit{VMEM} (on-chip SRAM, $\sim$30\,MB on v5e) and \textit{DMA transfers} between HBM and VMEM. The optimization loop:
 \begin{enumerate}
   \item Tile the computation so each tile's inputs fit in VMEM.
   \item Prefetch the next tile via DMA while the current tile is being computed on the MXU.
@@ -409,10 +410,10 @@ Take the FlashAttention optimization from Move~2a (tile QKV computation to fit i
 Address these questions:
 \begin{itemize}
   \item FlashAttention tiles $Q$ into blocks that fit in shared memory. On a TPU, what determines the tile size? (VMEM capacity and MXU dimensions.)
-  \item FlashAttention uses \texttt{\_\_syncthreads()} between loading a KV tile and computing attention scores. What is the TPU equivalent? (Implicit in Pallas's grid execution model --- each tile is a separate grid cell.)
+  \item FlashAttention uses \texttt{\_\_syncthreads()} between loading a KV tile and computing attention scores. What is the TPU equivalent? (Implicit in Pallas's grid execution model, where each tile is a separate grid cell.)
   \item FlashAttention double-buffers KV tiles: loading tile $k+1$ while computing on tile $k$. How does this map to Pallas? (\texttt{Buffered(buffer\_count=2)} in the \texttt{BlockSpec}.)
   \item The online softmax maintains running $(m, \ell)$ state across tiles. On a TPU, where does this state live? (VMEM scratch space via \texttt{scratch\_shapes}, or VREGs if small enough.)
-  \item FlashAttention's backward pass recomputes the forward attention from saved $Q$, $K$, $V$ instead of storing the $N^2$ matrix. Does this recomputation strategy change on a TPU? (No --- the memory-vs-recompute tradeoff is hardware-independent; the TPU's larger VMEM may allow slightly larger tiles but the algorithm is the same.)
+  \item FlashAttention's backward pass recomputes the forward attention from saved $Q$, $K$, $V$ instead of storing the $N^2$ matrix. Does this recomputation strategy change on a TPU? (No, the memory-vs-recompute tradeoff is hardware-independent; the TPU's larger VMEM may allow slightly larger tiles but the algorithm is the same.)
 \end{itemize}
 
 Write a one-paragraph summary: what is shared between the GPU and TPU implementations, and what must change?
